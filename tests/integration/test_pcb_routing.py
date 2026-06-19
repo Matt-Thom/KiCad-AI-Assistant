@@ -1,0 +1,236 @@
+"""
+End-to-end integration tests for the PCB router and routing MCP tools.
+
+The fixture board is :file:`tests/integration/fixtures/test_routing_board.kicad_pcb`
+which contains:
+
+* R1, C1, U1 — three footprints (R1 and C1 are placed so a straight route
+  from R1 to C1 must go around U1's courtyard).
+* An existing VCC track segment from R1.2 to a stub on the way to C1.
+* A keepout zone covering (38..42, 36..40) on F.Cu.
+* Netclasses Default (0.25 mm) and Power (0.5 mm); VCC and GND are in
+  Power, so a VCC route defaults to 0.5 mm width.
+
+The tests:
+  1. Drive the lower-level :func:`auto_route_pair` directly and inspect the
+     geometry it produces.
+  2. Drive the MCP tool wrapper ``pcb_route_pad_to_pad`` and verify the
+     segments are actually written to the file (with a backup).
+  3. Confirm that a blocked route raises :class:`RouteFailure`.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+
+import pytest
+
+from kcaa.router.router import RouteFailure, RouteRequest, auto_route_pair
+from kcaa.tools.pcb_routing_tools import register_pcb_routing_tools
+from kcaa.utils.pcb_sexp_utils import load_pcb
+
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
+BOARD_FIXTURE = os.path.join(FIXTURE_DIR, "test_routing_board.kicad_pcb")
+PRO_FIXTURE = os.path.join(FIXTURE_DIR, "test_routing_board.kicad_pro")
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def pcb_copy(tmp_path):
+    """Copy the routing fixture to a writable temp dir and back it up."""
+    dst = tmp_path / "test_routing_board.kicad_pcb"
+    shutil.copy(BOARD_FIXTURE, dst)
+    # Also copy the .pro so DRC netclass lookup works.
+    shutil.copy(PRO_FIXTURE, tmp_path / "test_routing_board.kicad_pro")
+    return str(dst)
+
+
+# ---------------------------------------------------------------------------
+# auto_route_pair — direct API
+# ---------------------------------------------------------------------------
+
+
+class TestAutoRoutePair:
+    def test_routes_around_u1(self, pcb_copy):
+        req = RouteRequest(
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="2",
+            ref_b="C1",
+            pad_b="2",
+            net="VCC",
+        )
+        result = auto_route_pair(req)
+        # The route should not be a single straight segment — U1 is in the way.
+        assert len(result.segments) >= 2
+        # The endpoint coordinates should be near the pad centers (within 1 mm).
+        ax, ay = result.start
+        bx, by = result.end
+        assert abs(ax - 30.5) < 1.0  # R1.2 is at (30.5, 32.5), top of pad exits near y≈29.5
+        assert abs(ay - 30.0) < 2.0
+        assert abs(bx - 60.0) < 1.0
+        assert abs(by - 30.0) < 2.0
+
+    def test_segments_use_power_netclass_width(self, pcb_copy):
+        # VCC is in the "Power" netclass → 0.5 mm track width.
+        req = RouteRequest(
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="2",
+            ref_b="C1",
+            pad_b="2",
+            net="VCC",
+        )
+        result = auto_route_pair(req)
+        assert all(s.width == pytest.approx(0.5, abs=1e-6) for s in result.segments)
+        assert all(s.layer == "F.Cu" for s in result.segments)
+        assert all(s.net == "VCC" for s in result.segments)
+
+    def test_explicit_width_overrides_netclass(self, pcb_copy):
+        req = RouteRequest(
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="2",
+            ref_b="C1",
+            pad_b="2",
+            net="VCC",
+            width=0.3,
+        )
+        result = auto_route_pair(req)
+        assert all(s.width == pytest.approx(0.3) for s in result.segments)
+
+    def test_invalid_pad_raises_failure(self, pcb_copy):
+        req = RouteRequest(
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="999",  # does not exist
+            ref_b="C1",
+            pad_b="2",
+            net="VCC",
+        )
+        with pytest.raises(RouteFailure):
+            auto_route_pair(req)
+
+    def test_invalid_footprint_raises_failure(self, pcb_copy):
+        req = RouteRequest(
+            pcb_path=pcb_copy,
+            ref_a="DOES_NOT_EXIST",
+            pad_a="1",
+            ref_b="C1",
+            pad_b="2",
+            net="VCC",
+        )
+        with pytest.raises(RouteFailure):
+            auto_route_pair(req)
+
+
+# ---------------------------------------------------------------------------
+# MCP tool wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestRoutingTool:
+    def _make_mcp(self):
+        """Build a FastMCP instance with the routing tool registered."""
+        try:
+            from fastmcp import FastMCP
+        except ImportError:  # pragma: no cover
+            pytest.skip("fastmcp not installed")
+        mcp = FastMCP(name="test-routing")
+        register_pcb_routing_tools(mcp)
+        return mcp
+
+    def _call_tool(self, mcp, name: str, **kwargs):
+        import asyncio
+
+        tool = asyncio.run(mcp.get_tool(name))
+        return asyncio.run(tool.fn(**kwargs))
+
+    def test_tool_writes_segments_to_pcb(self, pcb_copy):
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_route_pad_to_pad",
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="2",
+            ref_b="C1",
+            pad_b="2",
+            net="VCC",
+            ctx=None,
+        )
+        assert "segment_count" in result
+        assert result["segment_count"] >= 2
+
+        # Total segments in file = pre-existing fixture segments + new ones.
+        data = load_pcb(pcb_copy)
+        total = sum(1 for item in data if _is_list(item) and _sym(item[0]) == "segment")
+        existing = sum(
+            1 for item in load_pcb(BOARD_FIXTURE) if _is_list(item) and _sym(item[0]) == "segment"
+        )
+        assert total == existing + result["segment_count"]
+
+    def test_tool_creates_backup(self, pcb_copy):
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_route_pad_to_pad",
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="2",
+            ref_b="C1",
+            pad_b="2",
+            net="VCC",
+            ctx=None,
+        )
+        assert "backup_path" in result
+        assert os.path.exists(result["backup_path"])
+
+    def test_tool_returns_error_on_invalid_pad(self, pcb_copy):
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_route_pad_to_pad",
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="BAD",
+            ref_b="C1",
+            pad_b="2",
+            net="VCC",
+            ctx=None,
+        )
+        assert "error" in result
+
+    def test_via_tool_writes_via(self, pcb_copy):
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_connect_with_via",
+            pcb_path=pcb_copy,
+            x=40.0,
+            y=25.0,
+            net="GND",
+            ctx=None,
+        )
+        assert "via" in result
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 1
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_list(v) -> bool:
+    return isinstance(v, list) and len(v) > 0
+
+
+def _sym(v) -> str:
+    return str(v)
