@@ -176,4 +176,15 @@
 			)
 		)
 	)
+	(gr_rect
+		(start 20.0 20.0)
+		(end 70.0 60.0)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(fill none)
+		(layer "Edge.Cuts")
+		(uuid "edge-cuts-rect-0000")
+	)
 )

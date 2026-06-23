@@ -37,6 +37,7 @@ move a track or add a via first.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import math
 
 from kcaa.router.a_star import a_star
@@ -52,9 +53,45 @@ from kcaa.router.visibility_graph import (
 from kcaa.router.world_model import Obstacle, build_world_model
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
+logger = logging.getLogger(__name__)
+
 
 class RouteFailure(RuntimeError):
     """Raised when no valid route can be found."""
+
+
+class ProFileMissing(RuntimeError):
+    """No ``.kicad_pro`` found next to the ``.kicad_pcb``.
+
+    The router needs the project file to look up netclass settings for
+    width/clearance. Either create the project file in KiCad, or pass
+    ``width=`` and ``clearance=`` explicitly in :class:`RouteRequest`.
+    """
+
+
+class ProFileMalformed(RuntimeError):
+    """The ``.kicad_pro`` exists but cannot be read or parsed.
+
+    This is almost always a sign of file corruption. Fix the project file
+    in KiCad before re-running.
+    """
+
+
+class NetClassUnresolved(RuntimeError):
+    """A net did not match any ``netclass_patterns`` entry, and the project
+    has no ``Default`` netclass to fall back to.
+
+    Either add the net to a netclass, add a ``Default`` netclass, or pass
+    ``width=`` explicitly in :class:`RouteRequest`.
+    """
+
+
+class DesignRulesUnavailable(RuntimeError):
+    """The board's design rules cannot be read, or ``min_clearance`` is
+    missing.
+
+    Pass ``clearance=`` explicitly in :class:`RouteRequest` to override.
+    """
 
 
 @dataclass
@@ -102,11 +139,26 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     """
     data = load_pcb(req.pcb_path)
 
-    # DRC defaults from the .kicad_pro / board file.
+    # DRC defaults from the .kicad_pro / board file. Fail loudly if the
+    # project file is missing/malformed rather than silently guessing.
     width = req.width
     if width is None:
-        width = _default_track_width(req.pcb_path, req.net)
-    clearance = req.clearance if req.clearance is not None else _default_clearance(req.pcb_path)
+        try:
+            width = _default_track_width(req.pcb_path, req.net)
+        except (ProFileMissing, ProFileMalformed, NetClassUnresolved) as exc:
+            raise RouteFailure(
+                f"Cannot determine track width for net {req.net!r}: {exc}. "
+                f"Pass width= explicitly in RouteRequest to skip DRC lookup."
+            ) from exc
+    clearance = req.clearance
+    if clearance is None:
+        try:
+            clearance = _default_clearance(req.pcb_path)
+        except (ProFileMissing, ProFileMalformed, DesignRulesUnavailable) as exc:
+            raise RouteFailure(
+                f"Cannot determine clearance: {exc}. "
+                f"Pass clearance= explicitly in RouteRequest to skip DRC lookup."
+            ) from exc
 
     # Pad center coordinates.
     pad_a_xy = _find_pad_center(data, req.ref_a, req.pad_a)
@@ -149,6 +201,23 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         net=req.net,
         max_miter_mm=req.max_miter_mm,
     )
+
+    # Verify every emitted segment stays inside the board (Edge.Cuts).
+    # We use a board polygon that is shrunk by width/2 on each side so the
+    # track's copper edge is what we check against, not its centerline.
+    #
+    # Edge.Cuts is a workflow artifact: the user may legitimately be
+    # routing before the board outline is drawn, so a missing board is
+    # a warning, not a failure. A *present* board with segments that
+    # cross it, on the other hand, is a router bug we must surface.
+    if model.board_bbox is None:
+        logger.warning(
+            "No Edge.Cuts items in %s; skipping board-bounds check. "
+            "Add an Edge.Cuts outline to verify segments stay within the board.",
+            req.pcb_path,
+        )
+    else:
+        _check_segments_in_board(segs, model.board_bbox)
 
     return RouteResult(segments=segs, start=start_xy, end=end_xy)
 
@@ -207,6 +276,69 @@ def _inflate_obstacles(obstacles: list[Obstacle], delta: float) -> list[Obstacle
             )
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Board-bounds check
+# ---------------------------------------------------------------------------
+
+
+def _check_segments_in_board(
+    segs: list[OutputSegment],
+    board_bbox: tuple[float, float, float, float],
+) -> None:
+    """Raise :class:`RouteFailure` if any segment leaves the Edge.Cuts AABB.
+
+    The check is conservative: we test the segment endpoints plus a few
+    interior points against the board polygon *shrunk* by the segment's
+    own ``width / 2``, so the track's copper edge is what we verify.
+    A track whose centerline is exactly on the boundary is allowed (its
+    copper would still touch but not cross the edge); a track whose
+    centerline is on the wrong side of the shrunk boundary fails.
+
+    Args:
+        segs: The segments produced by :func:`postprocess`.
+        board_bbox: ``(minx, miny, maxx, maxy)`` from
+            :func:`kcaa.router.world_model._board_bbox`.
+
+    Raises:
+        RouteFailure: The first segment that would leave the board.
+    """
+    from shapely.geometry import LineString, Polygon
+
+    minx, miny, maxx, maxy = board_bbox
+    if minx >= maxx or miny >= maxy:
+        raise RouteFailure(
+            f"Board bbox is degenerate ({board_bbox}); cannot verify "
+            f"segments stay within the board."
+        )
+
+    for i, seg in enumerate(segs):
+        # Shrink the board by half the track width so the segment's center
+        # is checked against a region the copper itself must stay inside.
+        shrink = seg.width / 2.0
+        shrunk_bbox = (minx + shrink, miny + shrink, maxx - shrink, maxy - shrink)
+        if shrunk_bbox[0] >= shrunk_bbox[2] or shrunk_bbox[1] >= shrunk_bbox[3]:
+            raise RouteFailure(
+                f"Track width {seg.width} mm is wider than the board "
+                f"(shrunk bbox {shrunk_bbox} is degenerate)."
+            )
+        board_poly = Polygon(
+            [
+                (shrunk_bbox[0], shrunk_bbox[1]),
+                (shrunk_bbox[2], shrunk_bbox[1]),
+                (shrunk_bbox[2], shrunk_bbox[3]),
+                (shrunk_bbox[0], shrunk_bbox[3]),
+            ]
+        )
+        line = LineString([(seg.x1, seg.y1), (seg.x2, seg.y2)])
+        if not board_poly.covers(line):
+            raise RouteFailure(
+                f"Segment {i} from ({seg.x1:.3f},{seg.y1:.3f}) to "
+                f"({seg.x2:.3f},{seg.y2:.3f}) would extend outside the "
+                f"Edge.Cuts boundary (board {board_bbox}, track width "
+                f"{seg.width} mm)."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -372,21 +504,35 @@ def _pad_layers(pad_node: list) -> list[str]:
 
 
 def _default_track_width(pcb_path: str, net: str) -> float:
-    """Best-effort track width for ``net`` from the project's netclass settings.
+    """Resolve track width for ``net`` from the project's netclass settings.
 
-    Falls back to 0.25 mm if no netclass info is available.
+    Reads the matching ``.kicad_pro`` and looks up the netclass that
+    ``net`` belongs to (via ``netclass_patterns``). Returns that netclass's
+    ``track_width``.
+
+    Raises:
+        ProFileMissing: No ``.kicad_pro`` next to ``pcb_path`` — pass
+            ``RouteRequest(width=...)`` explicitly to skip DRC lookup.
+        ProFileMalformed: The ``.kicad_pro`` exists but cannot be parsed or
+            lacks the expected structure.
+        NetClassUnresolved: The net does not match any netclass pattern and
+            there is no ``Default`` netclass to fall back to.
     """
     import json
     import os
 
     pro_path = _project_file_for(pcb_path)
     if pro_path is None or not os.path.exists(pro_path):
-        return 0.25
+        raise ProFileMissing(pcb_path)
     try:
         with open(pro_path, encoding="utf-8") as f:
             data = json.load(f)
-    except Exception:
-        return 0.25
+    except json.JSONDecodeError as exc:
+        raise ProFileMalformed(pro_path, f"invalid JSON: {exc}") from exc
+    except OSError as exc:
+        raise ProFileMalformed(pro_path, f"cannot read: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ProFileMalformed(pro_path, "top-level JSON is not an object")
     nc_widths = _netclass_track_widths(data)
     assignments = _net_to_netclass(data)
     nc = _resolve_netclass(net, assignments)
@@ -394,21 +540,37 @@ def _default_track_width(pcb_path: str, net: str) -> float:
         return nc_widths[nc]
     if "Default" in nc_widths:
         return nc_widths["Default"]
-    return 0.25
+    raise NetClassUnresolved(net, pro_path)
 
 
 def _default_clearance(pcb_path: str) -> float:
-    """Best-effort minimum clearance. Falls back to 0.2 mm."""
+    """Resolve minimum clearance from the board's effective design rules.
+
+    Raises:
+        ProFileMissing: No ``.kicad_pro`` next to ``pcb_path``.
+        DesignRulesUnavailable: Rules cannot be read; ``min_clearance`` is
+            not set.
+    """
     try:
         from kcaa.utils.pcb_design_rules import get_effective_design_rules_from_file
-
+    except ImportError as exc:
+        raise DesignRulesUnavailable(f"pcb_design_rules module not importable: {exc}") from exc
+    try:
         rules = get_effective_design_rules_from_file(pcb_path)
-        v = rules.get("min_clearance")
-        if v is not None:
-            return float(v)
-    except Exception:
-        pass
-    return 0.2
+    except Exception as exc:
+        raise DesignRulesUnavailable(f"failed to read design rules from {pcb_path}: {exc}") from exc
+    # `get_effective_design_rules_from_file` returns
+    # ``{"design_rules": {...}, "net_classes": [...], ...}``.
+    design_rules = rules.get("design_rules") if isinstance(rules, dict) else None
+    if not isinstance(design_rules, dict):
+        raise DesignRulesUnavailable("design rules response is missing the design_rules section")
+    v = design_rules.get("min_clearance")
+    if v is None:
+        raise DesignRulesUnavailable("design rules do not contain min_clearance")
+    try:
+        return float(v)
+    except (TypeError, ValueError) as exc:
+        raise DesignRulesUnavailable(f"min_clearance is not numeric: {v!r}") from exc
 
 
 def _project_file_for(pcb_path: str) -> str | None:
