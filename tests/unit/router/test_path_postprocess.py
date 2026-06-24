@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from kcaa.router.path_postprocess import (
     OutputSegment,
     OutputVia,
@@ -179,3 +181,58 @@ def test_postprocess_path_singleton_returns_empty():
     segs, vias = postprocess_path(path, width=0.25, net="VCC")
     assert segs == []
     assert vias == []
+
+
+# ---------------------------------------------------------------------------
+# Via diameter / drill defaults
+# ---------------------------------------------------------------------------
+
+
+def test_default_via_diameter_is_sane():
+    from kcaa.router.path_postprocess import DEFAULT_VIA_DIAMETER_MM
+
+    assert 0.3 <= DEFAULT_VIA_DIAMETER_MM <= 1.0
+
+
+def test_default_via_drill_is_sane():
+    from kcaa.router.path_postprocess import DEFAULT_VIA_DRILL_MM
+
+    assert 0.1 <= DEFAULT_VIA_DRILL_MM <= 0.5
+
+
+def test_explicit_via_diameter_overrides_default():
+    path = [
+        RouteNode(0.0, 0.0, "F.Cu", 0),
+        RouteNode(5.0, 0.0, "F.Cu", 1),
+        RouteNode(5.0, 0.0, "B.Cu", 2),
+    ]
+    segs, vias = postprocess_path(
+        path, width=0.25, net="VCC", via_diameter_mm=1.2, via_drill_mm=0.6
+    )
+    assert len(vias) == 1
+    assert vias[0].diameter == pytest.approx(1.2)
+    assert vias[0].drill == pytest.approx(0.6)
+
+
+def test_via_transition_carries_layer_pair():
+    path = [
+        RouteNode(0.0, 0.0, "F.Cu", 0),
+        RouteNode(5.0, 0.0, "F.Cu", 1),
+        RouteNode(5.0, 0.0, "B.Cu", 2),
+    ]
+    _, vias = postprocess_path(path, width=0.25, net="VCC")
+    assert vias[0].layers == ("F.Cu", "B.Cu")
+
+
+def test_via_transition_three_layers():
+    path = [
+        RouteNode(0.0, 0.0, "F.Cu", 0),
+        RouteNode(5.0, 0.0, "F.Cu", 1),
+        RouteNode(5.0, 0.0, "B.Cu", 2),
+        RouteNode(5.0, 5.0, "B.Cu", 3),
+        RouteNode(5.0, 5.0, "In1.Cu", 4),
+    ]
+    _, vias = postprocess_path(path, width=0.25, net="VCC")
+    assert len(vias) == 2
+    assert vias[0].layers == ("F.Cu", "B.Cu")
+    assert vias[1].layers == ("B.Cu", "In1.Cu")

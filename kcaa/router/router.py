@@ -270,6 +270,8 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         req.via_pairs,
         exits_a,
         exits_b,
+        start_layer=req.start_layer,
+        end_layer=req.end_layer,
     )
     if best is None:
         layers_desc = ", ".join(routing_layers)
@@ -531,6 +533,8 @@ def _try_route_multi(
     via_pairs: tuple[tuple[str, str], ...],
     exits_a: list[tuple[float, float]],
     exits_b: list[tuple[float, float]],
+    start_layer: str,
+    end_layer: str,
 ) -> tuple[tuple[float, float], tuple[float, float], list[RouteNode]] | None:
     """Multi-layer variant of :func:`_try_route`.
 
@@ -544,7 +548,15 @@ def _try_route_multi(
     for s in exits_a:
         for t in exits_b:
             try:
-                g = build_visibility_graph(obstacles, layers, s, t, via_pairs=relevant_pairs)
+                g = build_visibility_graph(
+                    obstacles,
+                    layers,
+                    s,
+                    t,
+                    via_pairs=relevant_pairs,
+                    start_layer=start_layer,
+                    end_layer=end_layer,
+                )
             except Exception:
                 continue
             if not g.adj.get(0) or not g.adj.get(1):

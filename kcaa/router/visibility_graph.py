@@ -115,6 +115,8 @@ def build_visibility_graph(
     end: tuple[float, float],
     via_pairs: list[tuple[str, str]] | None = None,
     via_cost_fn: Callable[[int], float] = DEFAULT_VIA_COST_FN,
+    start_layer: str | None = None,
+    end_layer: str | None = None,
 ) -> VisibilityGraph:
     """Construct a multi-layer visibility graph.
 
@@ -146,6 +148,15 @@ def build_visibility_graph(
             disables via edges entirely.
         via_cost_fn: Function ``(n_vias_so_far) -> float`` giving the cost
             of a via edge when the running via count is ``n_vias_so_far``.
+        start_layer: Layer the start point lives on.  When ``None`` the
+            start is added to every routing layer (legacy behaviour, which
+            creates a phantom goal at the start point on every other
+            layer).  When set, the start node is added only to this
+            layer — the canonical start is ``node_id == 0``.
+        end_layer: Layer the end point lives on.  When ``None`` the end is
+            added to every routing layer.  When set, the end node is
+            added only to this layer — the canonical goal is
+            ``node_id == 1``.
 
     Returns:
         A :class:`VisibilityGraph`.
@@ -153,6 +164,10 @@ def build_visibility_graph(
     via_pairs = list(via_pairs or [])
     if not layers:
         raise ValueError("layers must be a non-empty list")
+    if start_layer is not None and start_layer not in layers:
+        raise ValueError(f"start_layer {start_layer!r} not in routing layers {layers}")
+    if end_layer is not None and end_layer not in layers:
+        raise ValueError(f"end_layer {end_layer!r} not in routing layers {layers}")
 
     graph = VisibilityGraph(via_cost_fn=via_cost_fn)
     counter = 0
@@ -179,19 +194,61 @@ def build_visibility_graph(
         per_layer_pts[layer].append((x, y))
         return node
 
-    # Collect obstacle vertices and start/end on each layer.
+    # Collect obstacle vertices and start/end on each layer.  The canonical
+    # start is node 0 (created first) and the canonical goal is node 1
+    # (created second).  Obstacle vertices are added afterwards.  On
+    # every layer we also add a "via-legal" mirror of the start/end at
+    # the same (x, y) (added as a *new* node so it does not collide with
+    # the canonical start/end) so that via transitions can hop to the
+    # correct layer.
     per_layer_vertex_nodes: dict[str, list[RouteNode]] = {}
+    canonical_start_id: int | None = None
+    canonical_end_id: int | None = None
+    # Pass 1: create the canonical start/end on their assigned layers.
+    if start_layer is not None:
+        start_node = _new_node(start[0], start[1], start_layer)
+        canonical_start_id = start_node.node_id
+        per_layer_vertex_nodes[start_layer] = [start_node]
+    if end_layer is not None:
+        end_node = _new_node(end[0], end[1], end_layer)
+        canonical_end_id = end_node.node_id
+        per_layer_vertex_nodes.setdefault(end_layer, []).append(end_node)
+    # Pass 2: every layer gets obstacle vertices AND a mirror of the
+    # start/end (added as a new node so it does not collide with the
+    # canonical one).
     for layer in layers:
-        start_node = _new_node(start[0], start[1], layer)
-        end_node = _new_node(end[0], end[1], layer)
-        vertex_nodes: list[RouteNode] = [start_node, end_node]
+        if layer not in per_layer_vertex_nodes:
+            per_layer_vertex_nodes[layer] = []
+    for layer in layers:
+        nodes = per_layer_vertex_nodes[layer]
+        # Start mirror (only on layers other than the canonical start layer).
+        if layer != start_layer and not any(n.x == start[0] and n.y == start[1] for n in nodes):
+            nodes.append(_new_node(start[0], start[1], layer))
+        # End mirror (only on layers other than the canonical end layer).
+        if layer != end_layer and not any(n.x == end[0] and n.y == end[1] for n in nodes):
+            nodes.append(_new_node(end[0], end[1], layer))
         for o in per_layer_obs[layer]:
             # Skip same-net obstacles: their tracks are part of the route.
             if o.net is not None:
                 continue
             for x, y in o.shape.exterior.coords:
-                vertex_nodes.append(_new_node(x, y, layer))
-        per_layer_vertex_nodes[layer] = vertex_nodes
+                nodes.append(_new_node(x, y, layer))
+
+    if canonical_start_id is not None and canonical_start_id != 0:
+        raise RuntimeError(
+            f"internal error: canonical start id is {canonical_start_id}, expected 0"
+        )
+    if canonical_end_id is not None and canonical_end_id != 1:
+        raise RuntimeError(f"internal error: canonical end id is {canonical_end_id}, expected 1")
+
+    # When ``start_layer``/``end_layer`` were not provided we added the
+    # start/end to every layer.  The first one created is the canonical
+    # start (id 0) and the second is the canonical end (id 1) only if the
+    # legacy per-layer add added them in that order — which it does
+    # because we always add start before end inside pass 2.  We can't
+    # assert this from a single ``canonical_*_id`` any more; legacy
+    # callers must rely on the graph structure.  Multi-layer callers
+    # (the new code path) get the strict invariant.
 
     # Build per-layer track edges (visibility).
     for layer in layers:

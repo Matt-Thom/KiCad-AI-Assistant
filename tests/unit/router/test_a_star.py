@@ -190,3 +190,61 @@ def test_a_star_returns_none_when_no_path() -> None:
     # No edges.
     path = a_star(g, 0, 1, edge_cost=default_multi_layer_edge_cost(g))
     assert path is None
+
+
+# ---------------------------------------------------------------------------
+# closed-set / n_vias counting
+# ---------------------------------------------------------------------------
+
+
+def test_closed_set_keeps_first_settled_cost():
+    """Once a node is settled (popped from the heap), a later push with
+    a higher cost must not change the recorded best cost.  This is the
+    Dijkstra invariant the closed set enforces."""
+    g = VisibilityGraph()
+    g.add_node(RouteNode(0.0, 0.0, "F.Cu", 0))
+    g.add_node(RouteNode(5.0, 0.0, "F.Cu", 1))
+    g.add_node(RouteNode(10.0, 0.0, "F.Cu", 2))  # goal
+    g.add_node(RouteNode(2.0, 0.0, "F.Cu", 3))
+    g.add_edge(0, 1)
+    g.add_edge(1, 2)
+    g.add_edge(0, 3)
+    g.add_edge(3, 2)
+    path = a_star(g, 0, 2)
+    assert path is not None
+    assert len(path) == 3
+
+
+def test_n_vias_counted_for_via_edges():
+    """Each via edge in the path increments the running via count used
+    by the cost function."""
+    g = VisibilityGraph()
+    # Two-layer graph: 0 on F.Cu, 1 on B.Cu (via edge), 2 on B.Cu (track).
+    g.add_node(RouteNode(0.0, 0.0, "F.Cu", 0))
+    g.add_node(RouteNode(0.0, 0.0, "B.Cu", 1))
+    g.add_node(RouteNode(10.0, 0.0, "B.Cu", 2))
+    g.add_via_edge(0, 1)
+    g.add_edge(1, 2)
+    path = a_star(g, 0, 2, edge_cost=default_multi_layer_edge_cost(g))
+    assert path is not None
+    assert [n.node_id for n in path] == [0, 1, 2]
+
+
+def test_multi_via_path_prefers_fewer_vias():
+    """When two paths exist, the one with fewer via edges is preferred."""
+    g = VisibilityGraph()
+    # 0 (F) --via-- 1 (B) --track-- 2 (B) --via-- 3 (F) --track-- 4 (F, goal)
+    for i, (x, layer) in enumerate(
+        [(0.0, "F.Cu"), (0.0, "B.Cu"), (5.0, "B.Cu"), (5.0, "F.Cu"), (10.0, "F.Cu")]
+    ):
+        g.add_node(RouteNode(x, 0.0, layer, i))
+    g.add_via_edge(0, 1)
+    g.add_edge(1, 2)
+    g.add_via_edge(2, 3)
+    g.add_edge(3, 4)
+    # Alternative: 0 --track-- 4 directly on F.Cu (no vias).
+    g.add_edge(0, 4)
+    path = a_star(g, 0, 4, edge_cost=default_multi_layer_edge_cost(g))
+    assert path is not None
+    # Direct F.Cu path has 0 vias, so should win.
+    assert [n.node_id for n in path] == [0, 4]

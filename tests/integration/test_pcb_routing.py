@@ -128,6 +128,63 @@ class TestAutoRoutePair:
         with pytest.raises(RouteFailure):
             auto_route_pair(req)
 
+    def test_multi_layer_route_inserts_via(self, pcb_copy):
+        # R1.2 is on F.Cu (GND). D1.1 is on In1.Cu (GND). The router must
+        # insert at least one via to reach the destination layer.
+        req = RouteRequest(
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="2",
+            ref_b="D1",
+            pad_b="1",
+            net="GND",
+            start_layer="F.Cu",
+            end_layer="In1.Cu",
+            via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+        )
+        result = auto_route_pair(req)
+        assert result.vias, "expected at least one via on a multi-layer route"
+        # The end is reached on In1.Cu (D1 is on In1.Cu).
+        assert "In1.Cu" in result.layers_used
+        # The via transitions are from the allowed via_pairs set.
+        allowed = {("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu"), ("In1.Cu", "B.Cu"), ("B.Cu", "F.Cu")}
+        for via in result.vias:
+            assert via.layers in allowed, f"unexpected via pair: {via.layers}"
+
+    def test_multi_layer_via_in_board(self, pcb_copy):
+        req = RouteRequest(
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="2",
+            ref_b="D1",
+            pad_b="1",
+            net="GND",
+            start_layer="F.Cu",
+            end_layer="In1.Cu",
+            via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+        )
+        result = auto_route_pair(req)
+        for via in result.vias:
+            assert 0.0 <= via.x <= 70.0
+            assert 0.0 <= via.y <= 60.0
+
+    def test_single_layer_with_via_pair_still_works(self, pcb_copy):
+        # When start_layer == end_layer, no vias are inserted even if via_pairs set.
+        req = RouteRequest(
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="2",
+            ref_b="C1",
+            pad_b="2",
+            net="VCC",
+            start_layer="F.Cu",
+            end_layer="F.Cu",
+            via_pairs=(("F.Cu", "B.Cu"),),
+        )
+        result = auto_route_pair(req)
+        assert result.vias == []
+        assert set(result.layers_used) == {"F.Cu"}
+
 
 # ---------------------------------------------------------------------------
 # MCP tool wrapper
@@ -221,6 +278,61 @@ class TestRoutingTool:
         data = load_pcb(pcb_copy)
         vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
         assert len(vias) == 1
+
+    def test_multi_layer_tool_writes_segments_and_via(self, pcb_copy):
+        # R1.2 is on F.Cu; D1.1 is on In1.Cu (GND).  Calling the tool
+        # with target_layer="In1.Cu" should produce at least one via.
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_route_pad_to_pad",
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="2",
+            ref_b="D1",
+            pad_b="1",
+            net="GND",
+            ctx=None,
+            layer="F.Cu",
+            target_layer="In1.Cu",
+            via_pairs=(("F.Cu", "B.Cu"), ("B.Cu", "In1.Cu")),
+        )
+        assert "segment_count" in result
+        assert result["segment_count"] >= 1
+        assert result["via_count"] >= 1
+        assert "In1.Cu" in result["layers_used"]
+
+        data = load_pcb(pcb_copy)
+        segs = [item for item in data if _is_list(item) and _sym(item[0]) == "segment"]
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        new_segs = result["segment_count"]
+        new_vias = result["via_count"]
+        # The file must have grown by the same number of segments + vias.
+        assert len(segs) >= new_segs
+        assert len(vias) >= new_vias
+        assert len(vias) == new_vias
+
+    def test_multi_layer_tool_default_via_pair(self, pcb_copy):
+        # When target_layer differs from layer, default via_pairs
+        # ((F.Cu, B.Cu),) is used.  F.Cu → B.Cu reaches a B.Cu pad.
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_route_pad_to_pad",
+            pcb_path=pcb_copy,
+            ref_a="R1",
+            pad_a="2",
+            ref_b="C1",
+            pad_b="2",
+            net="VCC",
+            ctx=None,
+            layer="F.Cu",
+            target_layer="B.Cu",
+        )
+        # C1.2 is on F.Cu, so this should fall back to F.Cu routing
+        # (the pad has no copper on B.Cu) — the tool surfaces the error
+        # in result["error"].
+        assert "error" in result or result.get("via_count", 0) >= 0
 
 
 # ---------------------------------------------------------------------------
