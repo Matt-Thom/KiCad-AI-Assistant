@@ -517,7 +517,14 @@ def _try_route(
         for t in exits_b:
             try:
                 g = build_visibility_graph(obstacles, [layer], s, t)
-            except Exception:
+            except (ValueError, RuntimeError) as exc:
+                logger.debug(
+                    "visibility graph build failed on layer %s for exits %s->%s: %s",
+                    layer,
+                    s,
+                    t,
+                    exc,
+                )
                 continue
             if not g.adj.get(0) or not g.adj.get(1):
                 continue
@@ -557,7 +564,14 @@ def _try_route_multi(
                     start_layer=start_layer,
                     end_layer=end_layer,
                 )
-            except Exception:
+            except (ValueError, RuntimeError) as exc:
+                logger.debug(
+                    "visibility graph build failed on layers %s for exits %s->%s: %s",
+                    layers,
+                    s,
+                    t,
+                    exc,
+                )
                 continue
             if not g.adj.get(0) or not g.adj.get(1):
                 continue
