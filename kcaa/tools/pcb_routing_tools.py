@@ -44,8 +44,10 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         ctx: Context | None,
         layer: str = "F.Cu",
         width: float | None = None,
+        target_layer: str | None = None,
+        via_pairs: tuple[tuple[str, str], ...] | None = None,
     ) -> dict[str, Any]:
-        """Connect two pads with an obstacle-avoiding track on a single layer.
+        """Connect two pads with an obstacle-avoiding track, optionally across layers.
 
         Uses the no-shove PNS router: if the path is blocked by an existing
         track or footprint courtyard, the call fails rather than moving
@@ -68,14 +70,24 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             pad_b: Pad number on ``ref_b``.
             net: Net name to assign to the new segments.
             ctx: MCP context (unused).
-            layer: Copper layer to route on (``"F.Cu"`` by default).
+            layer: Starting copper layer (``"F.Cu"`` by default).
             width: Override the netclass track width (mm).  ``None`` uses the
                 DRC default for the net.
+            target_layer: Destination copper layer.  When ``None`` (default)
+                the route stays on ``layer``.  When set, the router may
+                insert through-hole vias to reach the destination.
+            via_pairs: Optional tuple of ``(from_layer, to_layer)`` pairs
+                the router is allowed to use as via transitions.  Defaults
+                to ``(("F.Cu", "B.Cu"),)`` when ``target_layer`` differs
+                from ``layer``; ignored otherwise.
 
         Returns:
             dict with:
                 segment_count: number of segments written.
                 segments: list of dicts ``{x1, y1, x2, y2, width, layer, net}``.
+                via_count: number of vias written (0 for single-layer).
+                vias: list of dicts ``{x, y, diameter, drill, layers, net}``.
+                layers_used: ordered list of layers touched by the path.
                 start: ``(x, y)`` exit point of pad_a.
                 end: ``(x, y)`` entry point of pad_b.
                 backup_path: path to the ``.bak`` created before writing.
@@ -83,6 +95,10 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
 
             Or ``{"error": "<message>"}`` on failure.
         """
+        if target_layer is None:
+            target_layer = layer
+        if via_pairs is None and target_layer != layer:
+            via_pairs = (("F.Cu", "B.Cu"),)
         req = RouteRequest(
             pcb_path=pcb_path,
             ref_a=ref_a,
@@ -91,8 +107,9 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             pad_b=pad_b,
             net=net,
             start_layer=layer,
-            end_layer=layer,
+            end_layer=target_layer,
             width=width,
+            via_pairs=via_pairs or (),
         )
         try:
             result = auto_route_pair(req)
@@ -101,11 +118,12 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         except (FileNotFoundError, ValueError) as exc:
             return {"error": f"Routing input error: {exc}"}
 
-        # Load the PCB and append the new segments.
+        # Load the PCB and append the new segments and vias.
         data = load_pcb(pcb_path)
         for seg in result.segments:
             data.append(_segment_to_sexp(seg))
-        # Vias are added via the helper when the caller wires two layers.
+        for via in result.vias:
+            data.append(_via_to_sexp(via))
         try:
             backup_path = save_pcb(pcb_path, data)
         except OSError as exc:
@@ -125,6 +143,19 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 }
                 for s in result.segments
             ],
+            "via_count": len(result.vias),
+            "vias": [
+                {
+                    "x": v.x,
+                    "y": v.y,
+                    "diameter": v.diameter,
+                    "drill": v.drill,
+                    "layers": [v.layers[0], v.layers[1]],
+                    "net": v.net,
+                }
+                for v in result.vias
+            ],
+            "layers_used": list(result.layers_used),
             "start": list(result.start),
             "end": list(result.end),
             "backup_path": backup_path,
