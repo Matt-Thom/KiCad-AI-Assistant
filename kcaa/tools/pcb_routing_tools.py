@@ -163,90 +163,29 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def pcb_add_via(
-        pcb_path: str,
-        x: float,
-        y: float,
-        net: str,
-        ctx: Context,
-        diameter: float = 0.8,
-        drill: float = 0.4,
-        layers: tuple[str, str] = ("F.Cu", "B.Cu"),
-    ) -> dict[str, Any]:
-        """Add a single through-hole via to the PCB at the given point.
-
-        PCB coordinates: mm, +X right, **+Y down**.  Use this after
-        ``pcb_route_pad_to_pad`` calls on two different layers to stitch
-        them together, or stand-alone to drop a stitching via on an
-        existing track.
-
-        The board file is rewritten once with a ``.bak`` backup made
-        before any change.  An ``{"error": "..."}`` return leaves the
-        file untouched.
-
-        Args:
-            pcb_path: Absolute path to the .kicad_pcb file.
-            x: Via x coordinate (mm).
-            y: Via y coordinate (mm).
-            net: Net name.
-            ctx: MCP context.
-            diameter: Pad diameter of the via (mm).  Default 0.8.
-            drill: Drill diameter of the via (mm).  Default 0.4.
-            layers: Two-element tuple of copper layers the via connects.
-
-        Returns:
-            dict with ``via`` info and ``backup_path``.
-        """
-        via = OutputVia(
-            x=x,
-            y=y,
-            diameter=diameter,
-            drill=drill,
-            layers=tuple(layers),
-            net=net,
-        )
-        data = load_pcb(pcb_path)
-        data.append(_via_to_sexp(via))
-        try:
-            backup_path = save_pcb(pcb_path, data)
-        except OSError as exc:
-            return {"error": f"Failed to write PCB file: {exc}"}
-        return {
-            "via": {
-                "x": via.x,
-                "y": via.y,
-                "diameter": via.diameter,
-                "drill": via.drill,
-                "layers": list(via.layers),
-                "net": via.net,
-            },
-            "backup_path": backup_path,
-            "pcb_path": pcb_path,
-        }
-
-    @mcp.tool()
     async def pcb_add_vias(
         pcb_path: str,
         vias: list[dict[str, Any]],
         ctx: Context | None,
     ) -> dict[str, Any]:
-        """Add multiple through-hole vias to the PCB in a single write.
+        """Add one or more through-hole vias to the PCB in a single write.
 
-        Each element of ``vias`` is a dict with the same shape as the
-        arguments of :func:`pcb_add_via` (without ``pcb_path``/``ctx``):
-        ``x``, ``y``, ``net``, plus optional ``diameter`` (0.8),
-        ``drill`` (0.4), ``layers`` (``("F.Cu", "B.Cu")``).  All vias
-        are written in one PCB rewrite so a single ``.bak`` covers the
-        whole batch.
+        Each element of ``vias`` is a dict with the keys ``x``, ``y``,
+        ``net`` plus optional ``diameter`` (default 0.8), ``drill``
+        (default 0.4), ``layers`` (default ``("F.Cu", "B.Cu")``).  Pass a
+        single-element list for a one-off via, or many for ground-plane
+        stitching / fan-out.  All vias are written in one PCB rewrite so
+        a single ``.bak`` covers the whole batch.
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
-            vias: List of via descriptor dicts.
+            vias: List of via descriptor dicts (1 or more).
             ctx: MCP context (unused).
 
         Returns:
             dict with ``via_count``, ``vias`` (list of written via
-            dicts), and ``backup_path``.  An ``{"error": "..."}`` return
+            dicts), and ``backup_path``.  An empty list is a no-op
+            (no write, no backup).  An ``{"error": "..."}`` return
             indicates the entire batch was rejected; the file is left
             untouched.
         """
@@ -265,6 +204,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 )
         except (KeyError, TypeError, ValueError) as exc:
             return {"error": f"Invalid via descriptor: {exc}"}
+        if not out_vias:
+            return {"via_count": 0, "vias": [], "backup_path": None, "pcb_path": pcb_path}
         data = load_pcb(pcb_path)
         for via in out_vias:
             data.append(_via_to_sexp(via))

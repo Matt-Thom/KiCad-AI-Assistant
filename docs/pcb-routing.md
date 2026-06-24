@@ -66,29 +66,21 @@ number of vias the route has already taken.  A two-via path costs
 `2.0 + 2.5 = 4.5 mm` of via overhead.  This biases the router toward
 fewer-layer solutions when both are viable.
 
-### Adding a single via manually
+### Adding vias
 
-For stitching two pre-existing tracks that already live on different
-layers, use the standalone via tool:
+Use ``pcb_add_vias`` to drop one or more through-hole vias.  Pass a
+single-element list for a one-off via, or many for ground-plane
+stitching / fan-out.  All vias are written in a single PCB rewrite
+with one ``.bak`` covering the whole batch.
 
 ```python
-await pcb_add_via(
+# Single via
+await pcb_add_vias(
     pcb_path="/path/to/board.kicad_pcb",
-    x=40.0, y=25.0,
-    net="GND",
-    diameter=0.8,   # optional, default 0.8
-    drill=0.4,      # optional, default 0.4
-    layers=("F.Cu", "B.Cu"),  # optional, default F<->B
+    vias=[{"x": 40.0, "y": 25.0, "net": "GND"}],
 )
-```
 
-### Adding multiple vias at once
-
-For ground-plane stitching or fan-out, use the batch tool.  It writes
-all vias in a single PCB rewrite with one ``.bak`` covering the whole
-batch:
-
-```python
+# Many vias (ground stitching / fan-out)
 await pcb_add_vias(
     pcb_path="/path/to/board.kicad_pcb",
     vias=[
@@ -99,11 +91,12 @@ await pcb_add_vias(
 )
 ```
 
-Each descriptor accepts the same optional keys as ``pcb_add_via``
-(``diameter``, ``drill``, ``layers``); only ``x``, ``y`` and ``net``
-are required.  An invalid descriptor (missing ``net``, non-numeric
-coordinate, etc.) rejects the *whole* batch and leaves the file
-untouched.
+Each descriptor accepts optional ``diameter`` (default 0.8), ``drill``
+(default 0.4), ``layers`` (default ``("F.Cu", "B.Cu")``); only
+``x``, ``y`` and ``net`` are required.  An empty list is a no-op (no
+write, no backup).  An invalid descriptor (missing ``net``,
+non-numeric coordinate, etc.) rejects the *whole* batch and leaves
+the file untouched.
 
 ## Failure modes
 

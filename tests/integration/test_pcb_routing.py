@@ -16,7 +16,7 @@ The tests:
      geometry it produces.
   2. Drive the MCP tool wrapper ``pcb_route_pad_to_pad`` and verify the
      segments are actually written to the file (with a backup).
-  3. Drive the via tools ``pcb_add_via`` and ``pcb_add_vias``.
+  3. Drive the via tool ``pcb_add_vias`` (single-element list for one via).
   4. Confirm that a blocked route raises :class:`RouteFailure`.
 """
 
@@ -268,14 +268,12 @@ class TestRoutingTool:
         mcp = self._make_mcp()
         result = self._call_tool(
             mcp,
-            "pcb_add_via",
+            "pcb_add_vias",
             pcb_path=pcb_copy,
-            x=40.0,
-            y=25.0,
-            net="GND",
+            vias=[{"x": 40.0, "y": 25.0, "net": "GND"}],
             ctx=None,
         )
-        assert "via" in result
+        assert result["via_count"] == 1
         data = load_pcb(pcb_copy)
         vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
         assert len(vias) == 1
