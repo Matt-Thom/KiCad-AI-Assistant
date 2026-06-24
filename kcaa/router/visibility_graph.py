@@ -51,10 +51,12 @@ class RouteNode:
 
 
 # Default via-cost function: first via is 2 mm, each additional adds 0.5 mm.
+# ``n`` is the number of via edges already taken on the path BEFORE this
+# via edge, so n=0 means "this is the first via".
 
 
 def DEFAULT_VIA_COST_FN(n: int) -> float:
-    return 2.0 + 0.5 * (n - 1)
+    return 2.0 + 0.5 * n
 
 
 @dataclass

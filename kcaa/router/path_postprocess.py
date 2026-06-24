@@ -21,6 +21,17 @@ max_miter)`` so it doesn't overshoot a tight corner.
 
 The post-processor is layer-aware; on output each segment carries its
 layer and the trace width.
+
+Multi-layer paths
+-----------------
+
+:func:`postprocess_path` walks a multi-layer A\\* path, groups consecutive
+nodes by layer, runs the single-layer post-processor on each group, and
+emits an :class:`OutputVia` at every layer transition. A layer transition
+is any pair of consecutive nodes whose ``layer`` attribute differs. A
+through-via is emitted at the transition point with ``layers = (from,
+to)``; the diameter / drill are taken from the project netclass
+(``via_diameter``/``via_drill``) and default to safe values.
 """
 
 from __future__ import annotations
@@ -99,6 +110,104 @@ def postprocess(
     # Apply mitering in-place on the segments by splitting interior corners.
     out = _apply_miters(out, max_miter_mm)
     return out
+
+
+# Default via dimensions when the project netclass does not provide them.
+# These are conservative 0.6 / 0.3 mm values that match KiCad's "Standard
+# via" defaults and work for general-purpose 1-2 layer boards.
+DEFAULT_VIA_DIAMETER_MM = 0.6
+DEFAULT_VIA_DRILL_MM = 0.3
+
+
+def postprocess_path(
+    path: list[RouteNode],
+    width: float,
+    net: str,
+    max_miter_mm: float = 1.0,
+    via_diameter_mm: float = DEFAULT_VIA_DIAMETER_MM,
+    via_drill_mm: float = DEFAULT_VIA_DRILL_MM,
+) -> tuple[list[OutputSegment], list[OutputVia]]:
+    """Convert a multi-layer A\\* path into mitered segments and vias.
+
+    Walks ``path`` left to right. Consecutive nodes sharing the same layer
+    are grouped; each group is post-processed with :func:`postprocess` to
+    produce :class:`OutputSegment` records on that layer. When the layer
+    changes between ``path[i]`` and ``path[i+1]``, an :class:`OutputVia` is
+    emitted at ``(path[i].x, path[i].y)`` with ``layers =
+    (path[i].layer, path[i+1].layer)``.
+
+    Invariant: the visibility graph constructs via nodes at the same (x, y)
+    across layers, so a layer transition always has
+    ``path[i].x == path[i+1].x`` and ``path[i].y == path[i+1].y``. This is
+    asserted in debug builds.
+
+    Args:
+        path: Ordered list of :class:`RouteNode` from start to goal.
+        width: Trace width in mm.
+        net: Net name.
+        max_miter_mm: Maximum miter cut length.
+        via_diameter_mm: Via pad diameter in mm.
+        via_drill_mm: Via drill diameter in mm.
+
+    Returns:
+        ``(segments, vias)`` — both lists are independent; segments never
+        reference vias and vice versa.
+
+    Raises:
+        RuntimeError: If the path's via edges have inconsistent (x, y) —
+            this is a programming error in the visibility graph builder.
+    """
+    segments: list[OutputSegment] = []
+    vias: list[OutputVia] = []
+
+    if len(path) < 2:
+        return segments, vias
+
+    # Walk in (start, end) pairs; whenever the layer changes, emit a via at
+    # the start node of the pair and start a new group on the new layer.
+    group: list[RouteNode] = [path[0]]
+    for i in range(1, len(path)):
+        prev = path[i - 1]
+        cur = path[i]
+        if cur.layer != prev.layer:
+            # Sanity-check: via edges should connect same (x, y) nodes.
+            if abs(cur.x - prev.x) > 1e-6 or abs(cur.y - prev.y) > 1e-6:
+                raise RuntimeError(
+                    f"Layer transition {prev.layer}->{cur.layer} at "
+                    f"({prev.x:.3f},{prev.y:.3f})->({cur.x:.3f},{cur.y:.3f}) "
+                    f"is not co-located; visibility graph bug."
+                )
+            # Emit the previous group as segments.
+            segments.extend(
+                postprocess(
+                    group, width=width, layer=prev.layer, net=net, max_miter_mm=max_miter_mm
+                )
+            )
+            # Emit the via at the transition point.
+            vias.append(
+                OutputVia(
+                    x=prev.x,
+                    y=prev.y,
+                    diameter=via_diameter_mm,
+                    drill=via_drill_mm,
+                    layers=(prev.layer, cur.layer),
+                    net=net,
+                )
+            )
+            # Start a new group on the new layer, including the current node
+            # so the via point is preserved in the new layer's polyline.
+            group = [cur]
+        else:
+            group.append(cur)
+    # Flush the final group.
+    if group:
+        segments.extend(
+            postprocess(
+                group, width=width, layer=group[-1].layer, net=net, max_miter_mm=max_miter_mm
+            )
+        )
+
+    return segments, vias
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ from kcaa.router.path_postprocess import (
     emit_segment_nodes,
     emit_via_nodes,
     postprocess,
+    postprocess_path,
 )
 from kcaa.router.visibility_graph import RouteNode
 
@@ -90,3 +91,91 @@ class TestEmission:
         assert "F.Cu" in flat
         assert "B.Cu" in flat
         assert "GND" in flat
+
+
+# ---------------------------------------------------------------------------
+# Multi-layer: postprocess_path
+# ---------------------------------------------------------------------------
+
+
+def test_postprocess_path_single_layer_emits_no_vias():
+    """A path with no layer transitions must produce no vias."""
+    path = _path((0.0, 0.0), (5.0, 0.0), (5.0, 5.0), layer="F.Cu")
+    segs, vias = postprocess_path(path, width=0.25, net="VCC")
+    assert vias == []
+    # Two segments (after collinear simplification only 2 points).
+    assert len(segs) >= 1
+    assert all(s.layer == "F.Cu" for s in segs)
+
+
+def test_postprocess_path_one_via_two_layers():
+    """A path that switches layer once emits exactly one via at the switch."""
+    path = [
+        RouteNode(0.0, 0.0, "F.Cu", 0),
+        RouteNode(5.0, 0.0, "F.Cu", 1),
+        RouteNode(5.0, 0.0, "B.Cu", 2),  # via
+        RouteNode(5.0, 5.0, "B.Cu", 3),
+    ]
+    segs, vias = postprocess_path(path, width=0.25, net="VCC")
+    assert len(vias) == 1
+    via = vias[0]
+    assert via.x == 5.0
+    assert via.y == 0.0
+    assert via.layers == ("F.Cu", "B.Cu")
+    assert via.net == "VCC"
+    # Two segments: one on F (0,0)->(5,0) and one on B (5,0)->(5,5).
+    layer_seq = [s.layer for s in segs]
+    assert "F.Cu" in layer_seq
+    assert "B.Cu" in layer_seq
+
+
+def test_postprocess_path_two_vias_three_layers():
+    """A path crossing three layers emits two vias."""
+    path = [
+        RouteNode(0.0, 0.0, "F.Cu", 0),
+        RouteNode(5.0, 0.0, "F.Cu", 1),
+        RouteNode(5.0, 0.0, "In1.Cu", 2),
+        RouteNode(5.0, 5.0, "In1.Cu", 3),
+        RouteNode(5.0, 5.0, "B.Cu", 4),
+    ]
+    segs, vias = postprocess_path(path, width=0.25, net="VCC")
+    assert len(vias) == 2
+    assert {v.layers for v in vias} == {("F.Cu", "In1.Cu"), ("In1.Cu", "B.Cu")}
+
+
+def test_postprocess_path_via_dimensions_from_call():
+    """Custom via_diameter and via_drill flow through to OutputVia."""
+    path = [
+        RouteNode(0.0, 0.0, "F.Cu", 0),
+        RouteNode(1.0, 0.0, "F.Cu", 1),
+        RouteNode(1.0, 0.0, "B.Cu", 2),
+    ]
+    _, vias = postprocess_path(path, width=0.25, net="GND", via_diameter_mm=0.8, via_drill_mm=0.4)
+    assert vias[0].diameter == 0.8
+    assert vias[0].drill == 0.4
+
+
+def test_postprocess_path_inconsistent_via_raises():
+    """Layer transition that moves (x, y) is a programming error."""
+    path = [
+        RouteNode(0.0, 0.0, "F.Cu", 0),
+        RouteNode(5.0, 0.0, "F.Cu", 1),
+        RouteNode(5.0, 1.0, "B.Cu", 2),  # via at non-matching (x, y)
+    ]
+    import pytest
+
+    with pytest.raises(RuntimeError, match="co-located"):
+        postprocess_path(path, width=0.25, net="VCC")
+
+
+def test_postprocess_path_empty_returns_empty():
+    segs, vias = postprocess_path([], width=0.25, net="VCC")
+    assert segs == []
+    assert vias == []
+
+
+def test_postprocess_path_singleton_returns_empty():
+    path = [RouteNode(0.0, 0.0, "F.Cu", 0)]
+    segs, vias = postprocess_path(path, width=0.25, net="VCC")
+    assert segs == []
+    assert vias == []

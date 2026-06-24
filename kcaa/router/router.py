@@ -40,11 +40,11 @@ from dataclasses import dataclass, field
 import logging
 import math
 
-from kcaa.router.a_star import a_star
+from kcaa.router.a_star import a_star, default_multi_layer_edge_cost
 from kcaa.router.path_postprocess import (
     OutputSegment,
     OutputVia,
-    postprocess,
+    postprocess_path,
 )
 from kcaa.router.visibility_graph import (
     RouteNode,
@@ -259,21 +259,33 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     exits_a = _pad_exit_points(pad_a_xy, pad_a_size)
     exits_b = _pad_exit_points(pad_b_xy, pad_b_size)
 
-    best = _try_route(buffered, req.start_layer, exits_a, exits_b)
+    # Pick the routing layers. For a single-layer route we still pass
+    # ``[req.start_layer]`` so the multi-layer graph is constructed
+    # uniformly. Vias are added when ``req.via_pairs`` connects layers
+    # that are both in the routing set.
+    routing_layers = _routing_layers(req)
+    best = _try_route_multi(
+        buffered,
+        routing_layers,
+        req.via_pairs,
+        exits_a,
+        exits_b,
+    )
     if best is None:
+        layers_desc = ", ".join(routing_layers)
         raise RouteFailure(
             f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
-            f"{req.ref_b}/{req.pad_b} on layer {req.start_layer}"
+            f"{req.ref_b}/{req.pad_b} across layers [{layers_desc}]"
         )
 
     start_xy, end_xy, path = best
-    segs = postprocess(
+    segs, vias = postprocess_path(
         path,
         width=width,
-        layer=req.start_layer,
         net=req.net,
         max_miter_mm=req.max_miter_mm,
     )
+    layers_used = _layers_used(path)
 
     # Verify every emitted segment stays inside the board (Edge.Cuts).
     # We use a board polygon that is shrunk by width/2 on each side so the
@@ -291,8 +303,16 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         )
     else:
         _check_segments_in_board(segs, model.board_bbox)
+        if vias:
+            _check_vias_in_board(vias, model.board_bbox)
 
-    return RouteResult(segments=segs, start=start_xy, end=end_xy)
+    return RouteResult(
+        segments=segs,
+        vias=vias,
+        start=start_xy,
+        end=end_xy,
+        layers_used=layers_used,
+    )
 
 
 def connect_with_via(
@@ -414,6 +434,39 @@ def _check_segments_in_board(
             )
 
 
+def _check_vias_in_board(
+    vias: list[OutputVia],
+    board_bbox: tuple[float, float, float, float],
+) -> None:
+    """Raise :class:`RouteFailure` if any via would land outside the board.
+
+    The via pad is a circle of radius ``diameter / 2``. To keep the entire
+    circle inside the board, we check its center against the AABB shrunk
+    by ``diameter / 2``.
+    """
+    minx, miny, maxx, maxy = board_bbox
+    if minx >= maxx or miny >= maxy:
+        raise RouteFailure(
+            f"Board bbox is degenerate ({board_bbox}); cannot verify vias stay within the board."
+        )
+    for i, via in enumerate(vias):
+        radius = via.diameter / 2.0
+        shrunk_bbox = (minx + radius, miny + radius, maxx - radius, maxy - radius)
+        if shrunk_bbox[0] >= shrunk_bbox[2] or shrunk_bbox[1] >= shrunk_bbox[3]:
+            raise RouteFailure(
+                f"Via diameter {via.diameter} mm is wider than the board "
+                f"(shrunk bbox {shrunk_bbox} is degenerate)."
+            )
+        if not (shrunk_bbox[0] <= via.x <= shrunk_bbox[2]) or not (
+            shrunk_bbox[1] <= via.y <= shrunk_bbox[3]
+        ):
+            raise RouteFailure(
+                f"Via {i} at ({via.x:.3f},{via.y:.3f}) with diameter "
+                f"{via.diameter} mm would extend outside the Edge.Cuts "
+                f"boundary (board {board_bbox})."
+            )
+
+
 # ---------------------------------------------------------------------------
 # Exit-point selection
 # ---------------------------------------------------------------------------
@@ -455,8 +508,8 @@ def _try_route(
     """Try every (exit_a, exit_b) pair and return the first successful path.
 
     Single-layer search: the caller passes one ``layer``; we build the graph
-    on that single layer only. Multi-layer routes are handled by the caller
-    (see :func:`auto_route_pair` for the multi-layer wiring).
+    on that single layer only. Multi-layer routes are handled by
+    :func:`_try_route_multi`.
     """
     for s in exits_a:
         for t in exits_b:
@@ -470,6 +523,67 @@ def _try_route(
             if path is not None:
                 return s, t, path
     return None
+
+
+def _try_route_multi(
+    obstacles: list[Obstacle],
+    layers: list[str],
+    via_pairs: tuple[tuple[str, str], ...],
+    exits_a: list[tuple[float, float]],
+    exits_b: list[tuple[float, float]],
+) -> tuple[tuple[float, float], tuple[float, float], list[RouteNode]] | None:
+    """Multi-layer variant of :func:`_try_route`.
+
+    Builds a single multi-layer visibility graph for the given ``layers`` and
+    ``via_pairs``; tries every (exit_a, exit_b) pair on the start and end
+    layers respectively. Returns the first successful path.
+    """
+    # Filter via_pairs down to the routing layers; via edges to other layers
+    # are unreachable in this graph and would only be visual noise.
+    relevant_pairs = [pair for pair in via_pairs if pair[0] in layers and pair[1] in layers]
+    for s in exits_a:
+        for t in exits_b:
+            try:
+                g = build_visibility_graph(obstacles, layers, s, t, via_pairs=relevant_pairs)
+            except Exception:
+                continue
+            if not g.adj.get(0) or not g.adj.get(1):
+                continue
+            path = a_star(g, 0, 1, edge_cost=default_multi_layer_edge_cost(g))
+            if path is not None:
+                return s, t, path
+    return None
+
+
+def _routing_layers(req: RouteRequest) -> list[str]:
+    """Return the ordered list of layers the router must consider.
+
+    Includes ``start_layer`` and ``end_layer`` and every layer referenced
+    by ``via_pairs``. Order is preserved with duplicates removed.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for layer in (req.start_layer, req.end_layer):
+        if layer not in seen:
+            out.append(layer)
+            seen.add(layer)
+    for top, bot in req.via_pairs:
+        for layer in (top, bot):
+            if layer not in seen:
+                out.append(layer)
+                seen.add(layer)
+    return out
+
+
+def _layers_used(path: list[RouteNode]) -> list[str]:
+    """Return the ordered, deduplicated list of layers touched by ``path``."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for node in path:
+        if node.layer not in seen:
+            out.append(node.layer)
+            seen.add(node.layer)
+    return out
 
 
 # ---------------------------------------------------------------------------

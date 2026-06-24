@@ -147,8 +147,9 @@ class TestMultiLayer:
         f_start = next(n for n in g.nodes if n.layer == "F" and (n.x, n.y) == (0.0, 0.0))
         b_start = next(n for n in g.nodes if n.layer == "B" and (n.x, n.y) == (0.0, 0.0))
         assert g.is_via_edge(f_start.node_id, b_start.node_id)
-        # Cost is via_cost_fn(1) = 2.0 mm by default.
-        assert abs(g.via_cost_fn(1) - 2.0) < 1e-9
+        # Default: first via is 2.0 mm, each additional adds 0.5 mm.
+        assert abs(g.via_cost_fn(0) - 2.0) < 1e-9
+        assert abs(g.via_cost_fn(1) - 2.5) < 1e-9
 
     def test_no_via_edge_when_layer_not_in_pair(self):
         g = build_visibility_graph(

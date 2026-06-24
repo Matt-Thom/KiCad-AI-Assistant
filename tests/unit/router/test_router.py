@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from kcaa.router.path_postprocess import OutputSegment
+from kcaa.router.path_postprocess import OutputSegment, OutputVia
 from kcaa.router.router import (
     DesignRulesUnavailable,
     NetClassUnresolved,
@@ -28,9 +28,12 @@ from kcaa.router.router import (
     RouteFailure,
     RouteRequest,
     _check_segments_in_board,
+    _check_vias_in_board,
     _default_clearance,
     _default_track_width,
+    _layers_used,
     _project_file_for,
+    _routing_layers,
     auto_route_pair,
 )
 
@@ -396,3 +399,92 @@ def test_pad_missing_on_layer_raises_route_failure(tmp_path: Path) -> None:
     with pytest.raises(RouteFailure) as excinfo:
         auto_route_pair(req)
     assert "no copper shape" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Multi-layer helper functions
+# ---------------------------------------------------------------------------
+
+
+def test_routing_layers_includes_start_end_and_via_pairs():
+    req = RouteRequest(
+        pcb_path="dummy",
+        ref_a="A",
+        pad_a="1",
+        ref_b="B",
+        pad_b="1",
+        net="N",
+        start_layer="F.Cu",
+        end_layer="B.Cu",
+        via_pairs=(("F.Cu", "B.Cu"),),
+    )
+    layers = _routing_layers(req)
+    assert layers == ["F.Cu", "B.Cu"]
+
+
+def test_routing_layers_dedupes():
+    req = RouteRequest(
+        pcb_path="dummy",
+        ref_a="A",
+        pad_a="1",
+        ref_b="B",
+        pad_b="1",
+        net="N",
+        start_layer="F.Cu",
+        end_layer="F.Cu",
+        via_pairs=(("F.Cu", "F.Cu"),),
+    )
+    layers = _routing_layers(req)
+    assert layers == ["F.Cu"]
+
+
+def test_layers_used_preserves_order_dedupes():
+    from kcaa.router.visibility_graph import RouteNode
+
+    path = [
+        RouteNode(0.0, 0.0, "F.Cu", 0),
+        RouteNode(5.0, 0.0, "F.Cu", 1),
+        RouteNode(5.0, 0.0, "B.Cu", 2),
+        RouteNode(5.0, 5.0, "B.Cu", 3),
+        RouteNode(5.0, 5.0, "F.Cu", 4),
+    ]
+    assert _layers_used(path) == ["F.Cu", "B.Cu"]
+
+
+def test_layers_used_empty():
+    assert _layers_used([]) == []
+
+
+# ---------------------------------------------------------------------------
+# _check_vias_in_board
+# ---------------------------------------------------------------------------
+
+
+def test_check_vias_in_board_pass_when_inside():
+    via = OutputVia(x=25.0, y=20.0, diameter=0.6, drill=0.3, layers=("F.Cu", "B.Cu"), net="VCC")
+    # Board 50x40; via at (25, 20) is well inside, even with 0.3 mm radius.
+    _check_vias_in_board([via], (0.0, 0.0, 50.0, 40.0))
+
+
+def test_check_vias_in_board_fail_when_outside():
+    via = OutputVia(x=-1.0, y=20.0, diameter=0.6, drill=0.3, layers=("F.Cu", "B.Cu"), net="VCC")
+    with pytest.raises(RouteFailure, match="extend outside"):
+        _check_vias_in_board([via], (0.0, 0.0, 50.0, 40.0))
+
+
+def test_check_vias_in_board_fail_when_too_close_to_edge():
+    # 0.6 mm diameter → 0.3 mm radius. Board ends at x=50, via at x=49.8.
+    via = OutputVia(x=49.8, y=20.0, diameter=0.6, drill=0.3, layers=("F.Cu", "B.Cu"), net="VCC")
+    with pytest.raises(RouteFailure, match="extend outside"):
+        _check_vias_in_board([via], (0.0, 0.0, 50.0, 40.0))
+
+
+def test_check_vias_in_board_empty_list():
+    # No vias to check — should be a no-op.
+    _check_vias_in_board([], (0.0, 0.0, 50.0, 40.0))
+
+
+def test_check_vias_in_board_degenerate_bbox():
+    via = OutputVia(x=10.0, y=10.0, diameter=0.6, drill=0.3, layers=("F.Cu", "B.Cu"), net="VCC")
+    with pytest.raises(RouteFailure, match="degenerate"):
+        _check_vias_in_board([via], (10.0, 10.0, 10.0, 10.0))
