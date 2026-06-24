@@ -345,3 +345,54 @@ def test_auto_route_pair_warns_when_no_edge_cuts(
     assert any("Edge.Cuts" in record.message for record in caplog.records), (
         f"Expected a warning mentioning Edge.Cuts; got {[r.message for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-layer request: layer / pad-layer validation
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_layer_in_pcb_raises_route_failure(tmp_path: Path) -> None:
+    """A start_layer / end_layer / via_pair layer that the PCB doesn't declare
+    must fail loudly with a RouteFailure that names the offending layer."""
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    dst.write_text(Path(src).read_text())
+
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="C1",
+        pad_b="1",
+        net="VCC",
+        width=0.3,
+        clearance=0.2,
+        start_layer="In1.Cu",  # 2-layer fixture has no In1.Cu
+    )
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(req)
+    assert "In1.Cu" in str(excinfo.value)
+
+
+def test_pad_missing_on_layer_raises_route_failure(tmp_path: Path) -> None:
+    """If a pad has no copper shape on the requested layer, routing from it
+    must fail loudly — never silently fall back to a guessed size."""
+    src = _fixture_pcb()
+    dst = tmp_path / "board.kicad_pcb"
+    dst.write_text(Path(src).read_text())
+
+    req = RouteRequest(
+        pcb_path=str(dst),
+        ref_a="R1",
+        pad_a="1",
+        ref_b="C1",
+        pad_b="1",
+        net="VCC",
+        width=0.3,
+        clearance=0.2,
+        end_layer="B.Cu",  # R1.1 / C1.1 are SMD on F.Cu in the fixture
+    )
+    with pytest.raises(RouteFailure) as excinfo:
+        auto_route_pair(req)
+    assert "no copper shape" in str(excinfo.value)

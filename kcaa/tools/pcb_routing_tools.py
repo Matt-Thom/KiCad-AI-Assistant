@@ -90,7 +90,8 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             ref_b=ref_b,
             pad_b=pad_b,
             net=net,
-            layer=layer,
+            start_layer=layer,
+            end_layer=layer,
             width=width,
         )
         try:

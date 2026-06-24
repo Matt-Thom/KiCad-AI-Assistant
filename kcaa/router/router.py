@@ -96,7 +96,30 @@ class DesignRulesUnavailable(RuntimeError):
 
 @dataclass
 class RouteRequest:
-    """A request to connect two pads with a track."""
+    """A request to connect two pads with a track.
+
+    The pads may live on different copper layers; in that case the router
+    will insert one or more vias to switch layers.
+
+    Attributes:
+        pcb_path: Absolute path to the ``.kicad_pcb`` file.
+        ref_a / pad_a: Reference designator and pad number for one end.
+        ref_b / pad_b: Reference designator and pad number for the other end.
+        net: Net name shared by both pads.
+        start_layer: Copper layer the pad-A copper shape is on.
+        end_layer: Copper layer the pad-B copper shape is on.
+        via_pairs: Allowed (top, bottom) layer pairs that may carry a
+            through-via. Default is ``(("F.Cu", "B.Cu"),)``. Pass an
+            explicit tuple to restrict transitions (e.g. to forbid inner-
+            layer vias on a 4-layer board).
+        width: Track width; ``None`` → resolve from netclass.
+        clearance: Minimum clearance to obstacles; ``None`` → resolve from
+            the board's design rules.
+        via_diameter / via_drill: Through-via dimensions; ``None`` →
+            resolve from netclass.
+        max_miter_mm: Maximum corner miter extension before falling back
+            to a sharp 90° corner.
+    """
 
     pcb_path: str
     ref_a: str
@@ -104,7 +127,9 @@ class RouteRequest:
     ref_b: str
     pad_b: str
     net: str
-    layer: str = "F.Cu"
+    start_layer: str = "F.Cu"
+    end_layer: str = "F.Cu"
+    via_pairs: tuple[tuple[str, str], ...] = (("F.Cu", "B.Cu"),)
     width: float | None = None  # if None, use DRC default for the net
     clearance: float | None = None
     via_diameter: float | None = None
@@ -114,12 +139,25 @@ class RouteRequest:
 
 @dataclass
 class RouteResult:
-    """The output of a successful routing attempt."""
+    """The output of a successful routing attempt.
+
+    Attributes:
+        segments: Track segments, all carrying the same ``layer`` as their
+            corresponding path run. A route that crosses layers has
+            multiple runs (one per layer), separated by vias.
+        vias: Through-vias inserted at layer transitions. Empty for a
+            single-layer route.
+        start / end: The pad centres the route connected.
+        layers_used: The copper layers the route actually traversed, in
+            order. Useful for callers that want to know whether a via
+            was inserted (``len(layers_used) > 1``).
+    """
 
     segments: list[OutputSegment] = field(default_factory=list)
     vias: list[OutputVia] = field(default_factory=list)
     start: tuple[float, float] = (0.0, 0.0)
     end: tuple[float, float] = (0.0, 0.0)
+    layers_used: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +167,8 @@ class RouteResult:
 
 def auto_route_pair(req: RouteRequest) -> RouteResult:
     """Connect pad ``req.pad_a`` on ``req.ref_a`` to pad ``req.pad_b`` on
-    ``req.ref_b`` on the same net ``req.net`` and same layer ``req.layer``.
+    ``req.ref_b`` on the same net ``req.net`` and same layer ``req.start_layer``
+    (and ``req.end_layer`` for the destination pad).
 
     Returns:
         A :class:`RouteResult` containing the segments and (optionally) vias.
@@ -138,6 +177,30 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         RouteFailure: If no path is found or inputs are invalid.
     """
     data = load_pcb(req.pcb_path)
+
+    # Validate requested layers against the PCB early. The visibility graph
+    # query below assumes both layers exist; checking later would produce
+    # a less informative error path.
+    pcb_layers = _pcb_layer_names(data)
+    for layer in (req.start_layer, req.end_layer):
+        if layer not in pcb_layers:
+            raise RouteFailure(
+                f"Layer {layer!r} is not present in PCB {req.pcb_path}; "
+                f"PCB layers are {pcb_layers}."
+            )
+    # via_pairs must reference layers that exist too — otherwise A* would
+    # never use those edges and the user might not notice.
+    for top, bot in req.via_pairs:
+        if top not in pcb_layers:
+            raise RouteFailure(
+                f"via_pairs contains top layer {top!r} which is not in PCB "
+                f"{req.pcb_path}; PCB layers are {pcb_layers}."
+            )
+        if bot not in pcb_layers:
+            raise RouteFailure(
+                f"via_pairs contains bottom layer {bot!r} which is not in PCB "
+                f"{req.pcb_path}; PCB layers are {pcb_layers}."
+            )
 
     # DRC defaults from the .kicad_pro / board file. Fail loudly if the
     # project file is missing/malformed rather than silently guessing.
@@ -181,23 +244,33 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     buffered = _inflate_obstacles(model.obstacles, width / 2.0 + clearance)
 
     # Pick candidate exit points on each pad edge.
-    pad_a_size = _find_pad_size(data, req.ref_a, req.pad_a, req.layer) or (1.0, 1.0)
-    pad_b_size = _find_pad_size(data, req.ref_b, req.pad_b, req.layer) or (1.0, 1.0)
+    pad_a_size = _find_pad_size(data, req.ref_a, req.pad_a, req.start_layer)
+    pad_b_size = _find_pad_size(data, req.ref_b, req.pad_b, req.end_layer)
+    if pad_a_size is None:
+        raise RouteFailure(
+            f"Pad {req.ref_a}/{req.pad_a} has no copper shape on layer "
+            f"{req.start_layer!r}; cannot route from there."
+        )
+    if pad_b_size is None:
+        raise RouteFailure(
+            f"Pad {req.ref_b}/{req.pad_b} has no copper shape on layer "
+            f"{req.end_layer!r}; cannot route to there."
+        )
     exits_a = _pad_exit_points(pad_a_xy, pad_a_size)
     exits_b = _pad_exit_points(pad_b_xy, pad_b_size)
 
-    best = _try_route(buffered, req.layer, exits_a, exits_b)
+    best = _try_route(buffered, req.start_layer, exits_a, exits_b)
     if best is None:
         raise RouteFailure(
             f"No obstacle-avoiding path from {req.ref_a}/{req.pad_a} to "
-            f"{req.ref_b}/{req.pad_b} on layer {req.layer}"
+            f"{req.ref_b}/{req.pad_b} on layer {req.start_layer}"
         )
 
     start_xy, end_xy, path = best
     segs = postprocess(
         path,
         width=width,
-        layer=req.layer,
+        layer=req.start_layer,
         net=req.net,
         max_miter_mm=req.max_miter_mm,
     )
@@ -397,6 +470,26 @@ def _try_route(
 # ---------------------------------------------------------------------------
 # Pad lookup (parse the PCB tree directly)
 # ---------------------------------------------------------------------------
+
+
+def _pcb_layer_names(data: list) -> list[str]:
+    """Return the ordered list of layer names declared in the PCB.
+
+    Reads the PCB root's ``(layers (idx "name" type) ...)`` section and
+    returns just the names in their declared order. Returns an empty list
+    if the section is missing.
+    """
+    for item in data:
+        if not _is_list(item) or str(item[0]) != "layers":
+            continue
+        names: list[str] = []
+        for sub in item[1:]:
+            if not _is_list(sub) or len(sub) < 2:
+                continue
+            v = sub[1]
+            names.append(v if isinstance(v, str) else str(v))
+        return names
+    return []
 
 
 def _find_pad_center(
