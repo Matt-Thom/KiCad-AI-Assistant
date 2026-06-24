@@ -12,9 +12,11 @@ A\\* on this graph is fast and produces geometric shortest paths.
 Node layer
 ----------
 
-Every node carries a layer. Edges exist only between nodes on the same layer
-(direct routing on a copper plane). Switching layers happens via ``via`` nodes
-(see :mod:`kcaa.router.router`).
+Every node carries a layer. Edges come in two flavours:
+
+* **Track edges** connect nodes on the same layer; cost is Euclidean distance.
+* **Via edges** connect nodes at the same (x, y) on different layers; cost is
+  a per-via-count penalty (see :mod:`kcaa.router.router`).
 
 Spatial prefilter
 -----------------
@@ -25,7 +27,7 @@ rtree over obstacle bounding boxes so that only nearby obstacles are checked.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 import math
 
@@ -48,12 +50,26 @@ class RouteNode:
         return math.hypot(self.x - other.x, self.y - other.y)
 
 
+# Default via-cost function: first via is 2 mm, each additional adds 0.5 mm.
+
+
+def DEFAULT_VIA_COST_FN(n: int) -> float:
+    return 2.0 + 0.5 * (n - 1)
+
+
 @dataclass
 class VisibilityGraph:
-    """Adjacency map from node_id to set of visible node_ids."""
+    """Adjacency map from node_id to set of visible node_ids.
+
+    Via edges (cross-layer) are tracked separately in :attr:`via_edges` so the
+    A\\* search can compute their cost lazily from the running via count.
+    """
 
     nodes: list[RouteNode] = field(default_factory=list)
     adj: dict[int, set[int]] = field(default_factory=dict)
+    # set of (a, b) pairs that are via edges; both directions stored.
+    via_edges: set[tuple[int, int]] = field(default_factory=set)
+    via_cost_fn: Callable[[int], float] = DEFAULT_VIA_COST_FN
 
     def add_node(self, node: RouteNode) -> int:
         nid = node.node_id
@@ -69,6 +85,18 @@ class VisibilityGraph:
         self.adj.setdefault(a, set()).add(b)
         self.adj.setdefault(b, set()).add(a)
 
+    def add_via_edge(self, a: int, b: int) -> None:
+        """Add a via (cross-layer) edge between ``a`` and ``b``."""
+        if a == b:
+            return
+        self.adj.setdefault(a, set()).add(b)
+        self.adj.setdefault(b, set()).add(a)
+        self.via_edges.add((a, b))
+        self.via_edges.add((b, a))
+
+    def is_via_edge(self, a: int, b: int) -> bool:
+        return (a, b) in self.via_edges
+
     def neighbors(self, nid: int) -> Iterable[int]:
         return self.adj.get(nid, ())
 
@@ -80,67 +108,139 @@ class VisibilityGraph:
 
 def build_visibility_graph(
     obstacles: list[Obstacle],
-    layer: str,
+    layers: list[str],
     start: tuple[float, float],
     end: tuple[float, float],
+    via_pairs: list[tuple[str, str]] | None = None,
+    via_cost_fn: Callable[[int], float] = DEFAULT_VIA_COST_FN,
 ) -> VisibilityGraph:
-    """Construct a visibility graph over ``layer``.
+    """Construct a multi-layer visibility graph.
 
-    Candidate nodes are the start, end, and all obstacle vertices that sit
-    on ``layer``. Edges are visibility connections between same-layer nodes
-    whose straight line crosses no obstacle.
+    The graph contains per-layer track edges and cross-layer via edges:
+
+    1. **Per-layer nodes**: on each layer, candidate nodes are the start, end
+       and the vertices of obstacles that sit on that layer.
+    2. **Per-layer track edges**: visibility connections between same-layer
+       nodes whose straight line crosses no obstacle on that layer.
+    3. **Cross-layer via nodes**: an (x, y) is via-legal if it lies **outside
+       every obstacle on every routing layer**. For every via-legal (x, y)
+       that is missing from a layer, a node is added on that layer.
+    4. **Via edges**: for each via-legal (x, y) and every pair in
+       ``via_pairs`` whose two layers both have a node at that (x, y), add a
+       via edge with cost ``via_cost_fn(via_count_so_far)``.
 
     Same-net obstacles (``net is not None``) are not added as obstacles and
     their vertices are also excluded from the graph — a track should not be
     told to "go around" itself.
 
     Args:
-        obstacles: All obstacles; only those on ``layer`` participate.
-        layer: The routing layer (e.g. ``"F.Cu"``).
+        obstacles: All obstacles; only those whose ``layers`` overlap with
+            ``layers`` participate.
+        layers: Routing layers (e.g. ``["F.Cu", "B.Cu"]``).
         start: Start point in world coordinates.
         end: End point in world coordinates.
+        via_pairs: Optional list of ``(top_layer, bottom_layer)`` tuples.
+            Via edges are only added for these layer pairs. Empty / ``None``
+            disables via edges entirely.
+        via_cost_fn: Function ``(n_vias_so_far) -> float`` giving the cost
+            of a via edge when the running via count is ``n_vias_so_far``.
 
     Returns:
         A :class:`VisibilityGraph`.
     """
-    # Only consider obstacles on this layer.
-    layer_obs = [o for o in obstacles if layer in o.layers]
+    via_pairs = list(via_pairs or [])
+    if not layers:
+        raise ValueError("layers must be a non-empty list")
 
-    # Build rtree for spatial prefilter.
-    rtree_idx = index.Index()
-    for i, o in enumerate(layer_obs):
-        rtree_idx.insert(i, o.shape.bounds)
-
-    graph = VisibilityGraph()
+    graph = VisibilityGraph(via_cost_fn=via_cost_fn)
     counter = 0
 
-    def _new_node(x: float, y: float) -> RouteNode:
+    # Per-layer rtree keyed by layer → (rtree, obstacles_on_layer).
+    per_layer_rtree: dict[str, index.Index] = {}
+    per_layer_obs: dict[str, list[Obstacle]] = {}
+    for layer in layers:
+        layer_obs = [o for o in obstacles if layer in o.layers]
+        per_layer_obs[layer] = layer_obs
+        rtree_idx = index.Index()
+        for i, o in enumerate(layer_obs):
+            rtree_idx.insert(i, o.shape.bounds)
+        per_layer_rtree[layer] = rtree_idx
+
+    # Per-layer candidate set: dict layer → list[(x, y)].
+    per_layer_pts: dict[str, list[tuple[float, float]]] = {layer: [] for layer in layers}
+
+    def _new_node(x: float, y: float, layer: str) -> RouteNode:
         nonlocal counter
         node = RouteNode(x=x, y=y, layer=layer, node_id=counter)
         graph.add_node(node)
         counter += 1
+        per_layer_pts[layer].append((x, y))
         return node
 
-    _new_node(*start)
-    _new_node(*end)
+    # Collect obstacle vertices and start/end on each layer.
+    per_layer_vertex_nodes: dict[str, list[RouteNode]] = {}
+    for layer in layers:
+        start_node = _new_node(start[0], start[1], layer)
+        end_node = _new_node(end[0], end[1], layer)
+        vertex_nodes: list[RouteNode] = [start_node, end_node]
+        for o in per_layer_obs[layer]:
+            # Skip same-net obstacles: their tracks are part of the route.
+            if o.net is not None:
+                continue
+            for x, y in o.shape.exterior.coords:
+                vertex_nodes.append(_new_node(x, y, layer))
+        per_layer_vertex_nodes[layer] = vertex_nodes
 
-    # Collect obstacle vertices as additional candidate nodes.
-    for o in layer_obs:
-        # Skip same-net obstacles: their tracks are part of the route.
-        if o.net is not None:
-            continue
-        for x, y in o.shape.exterior.coords:
-            _new_node(x, y)
+    # Build per-layer track edges (visibility).
+    for layer in layers:
+        layer_obs = per_layer_obs[layer]
+        rtree_idx = per_layer_rtree[layer]
+        nodes = per_layer_vertex_nodes[layer]
+        n = len(nodes)
+        for i in range(n):
+            for j in range(i + 1, n):
+                a = nodes[i]
+                b = nodes[j]
+                if _is_visible(a, b, layer_obs, rtree_idx):
+                    graph.add_edge(a.node_id, b.node_id)
 
-    # Connect every pair (O(n²)), using rtree prefilter to skip far pairs.
-    node_list = graph.nodes
-    n = len(node_list)
-    for i in range(n):
-        for j in range(i + 1, n):
-            a = node_list[i]
-            b = node_list[j]
-            if _is_visible(a, b, layer_obs, rtree_idx):
-                graph.add_edge(a.node_id, b.node_id)
+    # Identify via-legal (x, y) positions: the union of all candidate (x, y)
+    # that are free of obstacles on every layer. An (x, y) is free on a layer
+    # if a tiny probe (eps-radius circle) at that point does not intersect
+    # any obstacle's interior.
+    eps = 1e-6
+    all_pts: set[tuple[float, float]] = set()
+    for pts in per_layer_pts.values():
+        all_pts.update(pts)
+    via_legal: set[tuple[float, float]] = set()
+    for pt in all_pts:
+        if all(_is_free(pt, layer_obs, eps) for layer_obs in per_layer_obs.values()):
+            via_legal.add(pt)
+
+    # For each via-legal (x, y), add a node on any layer that's missing one.
+    # We keep the original node (whichever was created first on that layer) and
+    # only create new nodes for layers without an entry at that (x, y).
+    def _find_node(layer: str, pt: tuple[float, float]) -> RouteNode | None:
+        for node in per_layer_vertex_nodes[layer]:
+            if node.x == pt[0] and node.y == pt[1]:
+                return node
+        return None
+
+    for pt in via_legal:
+        for layer in layers:
+            if _find_node(layer, pt) is None:
+                new_node = _new_node(pt[0], pt[1], layer)
+                per_layer_vertex_nodes[layer].append(new_node)
+
+    # Add via edges. A via edge connects the same (x, y) across two layers
+    # that are in ``via_pairs``; both layers must have a node at that point.
+    for pt in via_legal:
+        nodes_by_layer = {layer: _find_node(layer, pt) for layer in layers}
+        for top, bot in via_pairs:
+            a = nodes_by_layer.get(top)
+            b = nodes_by_layer.get(bot)
+            if a is not None and b is not None:
+                graph.add_via_edge(a.node_id, b.node_id)
 
     return graph
 
@@ -167,11 +267,42 @@ def _is_visible(
     for i in candidates:
         o = obstacles[i]
         if seg.intersects(o.shape) and not seg.touches(o.shape):
-            # touches counts only at boundary; if endpoints are on the
-            # boundary (e.g. connecting to a footprint corner) it's still OK.
-            # A real interior intersection (cross) means blocked.
             return False
-        # If the segment *crosses* the interior, intersect returns a non-empty
-        # area.  touches at a single vertex is allowed (we'll avoid re-checking
-        # via the eps buffer).
+    return True
+
+
+def _is_free(
+    pt: tuple[float, float],
+    obstacles: list[Obstacle],
+    eps: float,
+) -> bool:
+    """True iff ``pt`` does not sit in the interior of any obstacle.
+
+    Used to test whether a via node is legal on a given layer. Boundary
+    contact is treated as free (the centre of a footprint pad is allowed to
+    be on the edge of an obstacle polygon).
+    """
+    from shapely.geometry import Point
+
+    probe = Point(pt[0], pt[1])
+    # Use a tiny buffer to detect "inside" — Point.within is exact.
+    for o in obstacles:
+        # Same-net obstacles are not in the way (their copper is the route).
+        if o.net is not None:
+            continue
+        if o.shape.intersects(probe) and not o.shape.touches(probe):
+            # Touches at the boundary counts as "on" — still free for via purposes.
+            # But probe is a point so it can only touch at the boundary exactly.
+            # A genuine interior intersection means blocked.
+            # Distinguish: interior if contains but not on boundary.
+            if o.shape.contains(probe):
+                return False
+            # Intersection at a single coordinate is "touches" — treat as free.
+            if not o.shape.touches(probe):
+                # Degenerate: intersection but neither contains nor touches —
+                # treat as blocked.
+                return False
+    # ``eps`` is currently unused but kept as a parameter so we can switch to
+    # buffered probes later if we hit edge cases with shapely's exact predicates.
+    del eps
     return True

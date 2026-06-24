@@ -452,11 +452,16 @@ def _try_route(
     exits_a: list[tuple[float, float]],
     exits_b: list[tuple[float, float]],
 ) -> tuple[tuple[float, float], tuple[float, float], list[RouteNode]] | None:
-    """Try every (exit_a, exit_b) pair and return the first successful path."""
+    """Try every (exit_a, exit_b) pair and return the first successful path.
+
+    Single-layer search: the caller passes one ``layer``; we build the graph
+    on that single layer only. Multi-layer routes are handled by the caller
+    (see :func:`auto_route_pair` for the multi-layer wiring).
+    """
     for s in exits_a:
         for t in exits_b:
             try:
-                g = build_visibility_graph(obstacles, layer, s, t)
+                g = build_visibility_graph(obstacles, [layer], s, t)
             except Exception:
                 continue
             if not g.adj.get(0) or not g.adj.get(1):
