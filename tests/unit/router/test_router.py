@@ -31,10 +31,12 @@ from kcaa.router.router import (
     _check_vias_in_board,
     _default_clearance,
     _default_track_width,
+    _find_footprint,
     _layers_used,
     _project_file_for,
     _routing_layers,
     auto_route_pair,
+    connect_with_via,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,6 +56,28 @@ def test_project_file_for_missing_returns_none(tmp_path: Path) -> None:
     pcb = tmp_path / "board.kicad_pcb"
     pcb.write_text("(kicad_pcb)\n")
     assert _project_file_for(str(pcb)) is None
+
+
+# ---------------------------------------------------------------------------
+# Local fixture for tests that need a real PCB
+# ---------------------------------------------------------------------------
+
+
+import os  # noqa: E402
+import shutil  # noqa: E402
+
+_FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "integration", "fixtures")
+_BOARD_FIXTURE = os.path.normpath(os.path.join(_FIXTURE_DIR, "test_routing_board.kicad_pcb"))
+_PRO_FIXTURE = os.path.normpath(os.path.join(_FIXTURE_DIR, "test_routing_board.kicad_pro"))
+
+
+@pytest.fixture
+def pcb_copy(tmp_path):
+    """Copy the routing fixture to a writable temp dir and bring its .pro."""
+    dst = tmp_path / "test_routing_board.kicad_pcb"
+    shutil.copy(_BOARD_FIXTURE, dst)
+    shutil.copy(_PRO_FIXTURE, tmp_path / "test_routing_board.kicad_pro")
+    return str(dst)
 
 
 # ---------------------------------------------------------------------------
@@ -488,3 +512,97 @@ def test_check_vias_in_board_degenerate_bbox():
     via = OutputVia(x=10.0, y=10.0, diameter=0.6, drill=0.3, layers=("F.Cu", "B.Cu"), net="VCC")
     with pytest.raises(RouteFailure, match="degenerate"):
         _check_vias_in_board([via], (10.0, 10.0, 10.0, 10.0))
+
+
+# ---------------------------------------------------------------------------
+# connect_with_via helper
+# ---------------------------------------------------------------------------
+
+
+def test_connect_with_via_uses_seg_a_endpoint():
+    seg_a = OutputSegment(x1=10.0, y1=5.0, x2=20.0, y2=5.0, width=0.25, layer="F.Cu", net="VCC")
+    seg_b = OutputSegment(x1=20.0, y1=5.0, x2=30.0, y2=5.0, width=0.25, layer="B.Cu", net="VCC")
+    via = connect_with_via(
+        seg_a, seg_b, net="VCC", diameter=0.8, drill=0.4, layer_a="F.Cu", layer_b="B.Cu"
+    )
+    assert via.x == 20.0
+    assert via.y == 5.0
+    assert via.diameter == 0.8
+    assert via.drill == 0.4
+    assert via.layers == ("F.Cu", "B.Cu")
+    assert via.net == "VCC"
+
+
+# ---------------------------------------------------------------------------
+# _find_footprint lookup
+# ---------------------------------------------------------------------------
+
+
+def test_find_footprint_returns_none_for_missing_ref():
+    # Empty PCB tree.
+    assert _find_footprint([], "R1") is None
+    # PCB tree with a different footprint.
+    fake_pcb = [
+        [
+            "footprint",
+            ["property", "Reference", "OTHER"],
+            ["pad", "1", "smd", "rect", ["at", 0.0, 0.0], ["size", 0.5, 0.5]],
+        ]
+    ]
+    assert _find_footprint(fake_pcb, "R1") is None
+
+
+def test_find_footprint_returns_footprint_for_existing_ref():
+    target = [
+        "footprint",
+        ["property", "Reference", "R1"],
+        ["pad", "1", "smd", "rect", ["at", 0.0, 0.0], ["size", 0.5, 0.5]],
+    ]
+    fake_pcb = [target, ["footprint", ["property", "Reference", "OTHER"]]]
+    assert _find_footprint(fake_pcb, "R1") is target
+
+
+# ---------------------------------------------------------------------------
+# ref_b pad coord branch
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_ref_b_pad_raises_failure(pcb_copy):
+    # R1.2 exists; C1.999 does not.  The router must raise RouteFailure
+    # for the ref_b side (symmetric to the ref_a side covered by
+    # test_invalid_pad_raises_failure).
+    req = RouteRequest(
+        pcb_path=pcb_copy,
+        ref_a="R1",
+        pad_a="2",
+        ref_b="C1",
+        pad_b="999",
+        net="VCC",
+    )
+    with pytest.raises(RouteFailure, match="C1/999 not found"):
+        auto_route_pair(req)
+
+
+# ---------------------------------------------------------------------------
+# thru-hole pad (no SMD size on layer)
+# ---------------------------------------------------------------------------
+
+
+def test_thru_hole_pad_on_unused_layer_raises_failure(pcb_copy):
+    # A thru-hole pad is on *.Cu layers but has a "through_hole" pad
+    # type with a hole, not an SMD rect — _find_pad_size returns None
+    # when the requested layer doesn't host the copper shape.  R1.1
+    # is an SMD on F.Cu only; requesting the route on B.Cu should
+    # fail because R1.1 has no copper shape there.
+    req = RouteRequest(
+        pcb_path=pcb_copy,
+        ref_a="R1",
+        pad_a="1",
+        ref_b="C1",
+        pad_b="2",
+        net="VCC",
+        start_layer="B.Cu",
+        end_layer="B.Cu",
+    )
+    with pytest.raises(RouteFailure, match="no copper shape"):
+        auto_route_pair(req)
