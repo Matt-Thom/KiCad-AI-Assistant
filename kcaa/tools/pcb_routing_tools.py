@@ -163,7 +163,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def pcb_connect_with_via(
+    async def pcb_add_via(
         pcb_path: str,
         x: float,
         y: float,
@@ -173,11 +173,16 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         drill: float = 0.4,
         layers: tuple[str, str] = ("F.Cu", "B.Cu"),
     ) -> dict[str, Any]:
-        """Insert a single through-hole via at a given point.
+        """Add a single through-hole via to the PCB at the given point.
 
         PCB coordinates: mm, +X right, **+Y down**.  Use this after
         ``pcb_route_pad_to_pad`` calls on two different layers to stitch
-        them together.
+        them together, or stand-alone to drop a stitching via on an
+        existing track.
+
+        The board file is rewritten once with a ``.bak`` backup made
+        before any change.  An ``{"error": "..."}`` return leaves the
+        file untouched.
 
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
@@ -186,7 +191,7 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             net: Net name.
             ctx: MCP context.
             diameter: Pad diameter of the via (mm).  Default 0.8.
-            drill: Drill diameter (mm).  Default 0.4.
+            drill: Drill diameter of the via (mm).  Default 0.4.
             layers: Two-element tuple of copper layers the via connects.
 
         Returns:
@@ -215,6 +220,71 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
                 "layers": list(via.layers),
                 "net": via.net,
             },
+            "backup_path": backup_path,
+            "pcb_path": pcb_path,
+        }
+
+    @mcp.tool()
+    async def pcb_add_vias(
+        pcb_path: str,
+        vias: list[dict[str, Any]],
+        ctx: Context | None,
+    ) -> dict[str, Any]:
+        """Add multiple through-hole vias to the PCB in a single write.
+
+        Each element of ``vias`` is a dict with the same shape as the
+        arguments of :func:`pcb_add_via` (without ``pcb_path``/``ctx``):
+        ``x``, ``y``, ``net``, plus optional ``diameter`` (0.8),
+        ``drill`` (0.4), ``layers`` (``("F.Cu", "B.Cu")``).  All vias
+        are written in one PCB rewrite so a single ``.bak`` covers the
+        whole batch.
+
+        Args:
+            pcb_path: Absolute path to the .kicad_pcb file.
+            vias: List of via descriptor dicts.
+            ctx: MCP context (unused).
+
+        Returns:
+            dict with ``via_count``, ``vias`` (list of written via
+            dicts), and ``backup_path``.  An ``{"error": "..."}`` return
+            indicates the entire batch was rejected; the file is left
+            untouched.
+        """
+        try:
+            out_vias: list[OutputVia] = []
+            for spec in vias:
+                out_vias.append(
+                    OutputVia(
+                        x=float(spec["x"]),
+                        y=float(spec["y"]),
+                        diameter=float(spec.get("diameter", 0.8)),
+                        drill=float(spec.get("drill", 0.4)),
+                        layers=tuple(spec.get("layers", ("F.Cu", "B.Cu"))),
+                        net=str(spec["net"]),
+                    )
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            return {"error": f"Invalid via descriptor: {exc}"}
+        data = load_pcb(pcb_path)
+        for via in out_vias:
+            data.append(_via_to_sexp(via))
+        try:
+            backup_path = save_pcb(pcb_path, data)
+        except OSError as exc:
+            return {"error": f"Failed to write PCB file: {exc}"}
+        return {
+            "via_count": len(out_vias),
+            "vias": [
+                {
+                    "x": v.x,
+                    "y": v.y,
+                    "diameter": v.diameter,
+                    "drill": v.drill,
+                    "layers": list(v.layers),
+                    "net": v.net,
+                }
+                for v in out_vias
+            ],
             "backup_path": backup_path,
             "pcb_path": pcb_path,
         }

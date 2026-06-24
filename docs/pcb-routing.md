@@ -72,7 +72,7 @@ For stitching two pre-existing tracks that already live on different
 layers, use the standalone via tool:
 
 ```python
-await pcb_connect_with_via(
+await pcb_add_via(
     pcb_path="/path/to/board.kicad_pcb",
     x=40.0, y=25.0,
     net="GND",
@@ -81,6 +81,29 @@ await pcb_connect_with_via(
     layers=("F.Cu", "B.Cu"),  # optional, default F<->B
 )
 ```
+
+### Adding multiple vias at once
+
+For ground-plane stitching or fan-out, use the batch tool.  It writes
+all vias in a single PCB rewrite with one ``.bak`` covering the whole
+batch:
+
+```python
+await pcb_add_vias(
+    pcb_path="/path/to/board.kicad_pcb",
+    vias=[
+        {"x": 30.0, "y": 35.0, "net": "VCC"},
+        {"x": 40.0, "y": 35.0, "net": "GND", "diameter": 1.0, "drill": 0.5},
+        {"x": 50.0, "y": 35.0, "net": "GND", "layers": ("F.Cu", "In1.Cu")},
+    ],
+)
+```
+
+Each descriptor accepts the same optional keys as ``pcb_add_via``
+(``diameter``, ``drill``, ``layers``); only ``x``, ``y`` and ``net``
+are required.  An invalid descriptor (missing ``net``, non-numeric
+coordinate, etc.) rejects the *whole* batch and leaves the file
+untouched.
 
 ## Failure modes
 

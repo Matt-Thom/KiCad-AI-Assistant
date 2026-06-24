@@ -16,7 +16,8 @@ The tests:
      geometry it produces.
   2. Drive the MCP tool wrapper ``pcb_route_pad_to_pad`` and verify the
      segments are actually written to the file (with a backup).
-  3. Confirm that a blocked route raises :class:`RouteFailure`.
+  3. Drive the via tools ``pcb_add_via`` and ``pcb_add_vias``.
+  4. Confirm that a blocked route raises :class:`RouteFailure`.
 """
 
 from __future__ import annotations
@@ -267,7 +268,7 @@ class TestRoutingTool:
         mcp = self._make_mcp()
         result = self._call_tool(
             mcp,
-            "pcb_connect_with_via",
+            "pcb_add_via",
             pcb_path=pcb_copy,
             x=40.0,
             y=25.0,
@@ -278,6 +279,51 @@ class TestRoutingTool:
         data = load_pcb(pcb_copy)
         vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
         assert len(vias) == 1
+
+    def test_batch_via_tool_writes_all(self, pcb_copy):
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[
+                {"x": 30.0, "y": 35.0, "net": "VCC"},
+                {"x": 40.0, "y": 35.0, "net": "GND", "diameter": 1.0, "drill": 0.5},
+            ],
+            ctx=None,
+        )
+        assert "via_count" in result
+        assert result["via_count"] == 2
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 2
+
+    def test_batch_via_tool_invalid_descriptor(self, pcb_copy):
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[{"x": 30.0, "y": 35.0}],  # missing 'net'
+            ctx=None,
+        )
+        assert "error" in result
+        # File must be untouched.
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 0
+
+    def test_batch_via_tool_empty_list(self, pcb_copy):
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[],
+            ctx=None,
+        )
+        assert result["via_count"] == 0
+        assert result["vias"] == []
 
     def test_multi_layer_tool_writes_segments_and_via(self, pcb_copy):
         # R1.2 is on F.Cu; D1.1 is on In1.Cu (GND).  Calling the tool
