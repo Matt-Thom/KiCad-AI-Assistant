@@ -98,6 +98,25 @@ write, no backup).  An invalid descriptor (missing ``net``,
 non-numeric coordinate, etc.) rejects the *whole* batch and leaves
 the file untouched.
 
+#### Pre-flight checks
+
+Before any write, every via is checked against:
+
+* the matching ``.kicad_pro`` — the via's ``net`` must resolve to a
+  netclass (or fall back to ``Default``), and the requested
+  ``diameter`` / ``drill`` must match that class (within 1 micron).
+  Missing ``.kicad_pro`` is a hard error: there is no silent skip.
+* the board geometry — the via's pad ring must not overlap any
+  footprint courtyard, other-net track/via, or zone keepout, and
+  must stay inside the board outline with the configured
+  ``min_copper_edge_clearance``.
+
+Any violation rejects the whole batch and leaves the file
+untouched.  The error response includes a `violations` array with
+`index` (the position in the input list), `kind`, and `message`
+fields per violation, plus a single concatenated `error` string
+for the human-readable summary.
+
 ## Failure modes
 
 | Failure | Meaning |

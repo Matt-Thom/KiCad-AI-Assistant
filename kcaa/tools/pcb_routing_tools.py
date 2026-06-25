@@ -25,6 +25,7 @@ from kcaa.router.router import (
     auto_route_pair,
     connect_with_via,
 )
+from kcaa.router.via_check import ProposedVia, check_vias
 from kcaa.utils.pcb_sexp_utils import load_pcb, save_pcb
 
 log = logging.getLogger(__name__)
@@ -177,6 +178,20 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
         stitching / fan-out.  All vias are written in one PCB rewrite so
         a single ``.bak`` covers the whole batch.
 
+        Before writing, the tool checks each via against:
+
+        * the matching ``.kicad_pro`` netclass rules — ``via_diameter``
+          and ``via_drill`` must match the net's netclass (within
+          1 micron); the project file must exist and the net must
+          resolve to a class (or ``Default``).
+        * the existing board geometry — the via's pad ring must not
+          overlap any footprint courtyard, other-net track/via, or
+          zone keepout, and must stay inside the board outline with
+          the configured ``min_copper_edge_clearance``.
+
+        Any violation rejects the whole batch; the file is left
+        untouched.
+
         Args:
             pcb_path: Absolute path to the .kicad_pcb file.
             vias: List of via descriptor dicts (1 or more).
@@ -206,6 +221,38 @@ def register_pcb_routing_tools(mcp: FastMCP) -> None:
             return {"error": f"Invalid via descriptor: {exc}"}
         if not out_vias:
             return {"via_count": 0, "vias": [], "backup_path": None, "pcb_path": pcb_path}
+
+        # Pre-flight: check netclass rules and position.  Any violation
+        # rejects the whole batch; the file is not modified.
+        proposed = [
+            ProposedVia(
+                x=v.x,
+                y=v.y,
+                diameter=v.diameter,
+                drill=v.drill,
+                layers=v.layers,
+                net=v.net,
+            )
+            for v in out_vias
+        ]
+        violations = check_vias(pcb_path, proposed)
+        if violations:
+            lines = [f"rejected {len(violations)} via violation(s):"]
+            for vio in violations:
+                idx = vio.index if vio.index >= 0 else "*"
+                lines.append(f"  - via #{idx} [{vio.kind}] {vio.message}")
+            return {
+                "error": "\n".join(lines),
+                "violations": [
+                    {
+                        "index": v.index,
+                        "kind": v.kind,
+                        "message": v.message,
+                        **v.detail,
+                    }
+                    for v in violations
+                ],
+            }
         data = load_pcb(pcb_path)
         for via in out_vias:
             data.append(_via_to_sexp(via))

@@ -286,7 +286,8 @@ class TestRoutingTool:
             pcb_path=pcb_copy,
             vias=[
                 {"x": 30.0, "y": 35.0, "net": "VCC"},
-                {"x": 40.0, "y": 35.0, "net": "GND", "diameter": 1.0, "drill": 0.5},
+                # GND is in the Power netclass (via_diameter=0.8, via_drill=0.4)
+                {"x": 40.0, "y": 35.0, "net": "GND", "diameter": 0.8, "drill": 0.4},
             ],
             ctx=None,
         )
@@ -322,6 +323,83 @@ class TestRoutingTool:
         )
         assert result["via_count"] == 0
         assert result["vias"] == []
+
+    def test_batch_via_tool_rejects_netclass_mismatch(self, pcb_copy):
+        # GND lives in the Power netclass (via_diameter=0.8, via_drill=0.4).
+        # Asking for 1.0/0.5 must be rejected.
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[{"x": 35.0, "y": 35.0, "net": "GND", "diameter": 1.0, "drill": 0.5}],
+            ctx=None,
+        )
+        assert "error" in result
+        assert "netclass" in result["error"]
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 0
+
+    def test_batch_via_tool_rejects_footprint_overlap(self, pcb_copy):
+        # R1 is placed in the test board.  Pull its footprint centre
+        # from the world model and drop a via right on top of it.
+        from kcaa.router.world_model import build_world_model
+
+        world = build_world_model(pcb_copy)
+        fp_obs = next(
+            (o for o in world.obstacles if o.kind == "footprint" and o.ref == "R1"),
+            None,
+        )
+        assert fp_obs is not None, "fixture should expose R1's courtyard"
+        centroid = fp_obs.shape.representative_point()
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[{"x": centroid.x, "y": centroid.y, "net": "VCC"}],
+            ctx=None,
+        )
+        assert "error" in result
+        assert "footprint" in result["error"]
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 0
+
+    def test_batch_via_tool_rejects_keepout_overlap(self, pcb_copy):
+        # The fixture has a keepout zone at (38..42, 36..40) on F.Cu.
+        # Default via layers are ("F.Cu", "B.Cu") so the F.Cu ring hits it.
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[{"x": 40.0, "y": 38.0, "net": "VCC"}],
+            ctx=None,
+        )
+        assert "error" in result
+        assert "keepout" in result["error"]
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 0
+
+    def test_batch_via_tool_rejects_board_edge(self, pcb_copy):
+        # Way outside the board outline.  Edge-clearance check uses
+        # min_copper_edge_clearance from the .kicad_pro if set, else 0.
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[{"x": -50.0, "y": -50.0, "net": "VCC"}],
+            ctx=None,
+        )
+        assert "error" in result
+        assert "board_edge" in result["error"]
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 0
 
     def test_multi_layer_tool_writes_segments_and_via(self, pcb_copy):
         # R1.2 is on F.Cu; D1.1 is on In1.Cu (GND).  Calling the tool
