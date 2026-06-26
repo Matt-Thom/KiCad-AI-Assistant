@@ -5,15 +5,31 @@ Used by :func:`kcaa.tools.pcb_routing_tools.pcb_add_vias` before any
 write to the .kicad_pcb file.  A single failure rejects the whole
 batch; the file is left untouched.
 
-Three independent checks, all producing ``Violation`` records:
+Two layers of rules are enforced:
 
-1. **Netclass rules** — the via's net has a netclass in the matching
-   ``.kicad_pro``; if its ``via_diameter``/``via_drill`` disagree with
-   what the user requested, report a mismatch.
-2. **Position** — the via's pad ring (radius = diameter/2) must not
-   overlap any forbidden obstacle on a layer it occupies.
-3. **Board edge** — the via must stay inside the board outline with
-   at least ``min_copper_edge_clearance`` (or 0 if not set).
+1. **Netclass (upper limit)** — the via's net resolves to a netclass
+   in the matching ``.kicad_pro``; the requested ``diameter`` /
+   ``drill`` should not exceed the netclass's
+   ``via_diameter`` / ``via_drill``.  A mismatch is reported as
+   a "netclass" violation.
+2. **Board DRC + position** — every request must respect the
+   project-level constraints from
+   ``board.design_settings.rules``:
+
+   * ``min_via_size``            — via pad diameter >= this (mm)
+   * ``min_through_drill``       — drill diameter >= this (mm)
+   * ``min_via_annular_width``   — (diameter - drill) / 2 >= this (mm)
+   * ``min_hole_to_hole``        — centre-to-centre distance between
+                                   this via's hole and every existing
+                                   via's hole (and the other vias in
+                                   the same batch) >= this (mm)
+   * ``min_clearance``           — the via pad ring, buffered by this
+                                   distance, must not overlap any
+                                   foreign-net track / pad / via
+   * ``copper_edge_clearance``   — via centre must stay this far
+                                   inside the board outline
+
+   Any of those rules failing produces a "drc" violation.
 
 The check is intentionally **strict**:
 
@@ -138,11 +154,13 @@ def check_vias(pcb_path: str, vias: list[ProposedVia]) -> list[Violation]:
     # except those on the via's own net — perfect for our needs.
     world = build_world_model(pcb_path)
 
-    # Board-edge clearance, in mm.  0 if KiCad DRC didn't expose it.
-    edge_clear = _min_copper_edge_clearance(pcb_path)
+    # Board DRC minimums (via size, drill, annular, clearance, hole-to-hole,
+    # copper-edge clearance).  Empty dict if .kicad_pro is missing or the
+    # project has no design_rules block.
+    board = _load_board_constraints(pcb_path)
 
     for i, via in enumerate(vias):
-        violations.extend(_check_position(i, via, world, edge_clear))
+        violations.extend(_check_position(i, via, world, board, vias))
 
     return violations
 
@@ -250,36 +268,160 @@ def _resolve_netclass_rules(
     return out
 
 
-def _min_copper_edge_clearance(pcb_path: str) -> float:
-    """Read min_copper_edge_clearance from .kicad_pro if set, else 0."""
-    pro_path = find_project_file(pcb_path)
-    if pro_path is None:
-        return 0.0
+def _load_board_constraints(pcb_path: str) -> dict[str, float]:
+    """Read the project's board-level DRC constraints.
+
+    Returns a dict keyed by the same user-facing names as
+    :func:`kcaa.utils.pcb_design_rules.get_effective_design_rules_from_file`.
+    Keys that aren't set in the project file are omitted (callers must
+    default each rule to ``None`` / "skip").
+
+    Recognised keys:
+
+    * ``min_via_size``            — minimum via pad diameter (mm)
+    * ``min_through_drill``       — minimum drill diameter (mm)
+    * ``min_via_annular_width``   — minimum copper ring width (mm)
+    * ``min_clearance``           — minimum copper-to-copper clearance (mm)
+    * ``hole_to_hole_min``        — minimum centre-to-centre distance
+                                    between holes / vias (mm)
+    * ``copper_edge_clearance``   — minimum distance from copper to the
+                                    board edge (mm)
+    """
     try:
-        with open(pro_path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return 0.0
-    if not isinstance(data, dict):
-        return 0.0
-    rules = data.get("design_rules", {})
-    if not isinstance(rules, dict):
-        return 0.0
-    val = rules.get("min_copper_edge_clearance")
-    if isinstance(val, int | float):
-        return float(val)
-    return 0.0
+        from kcaa.utils.pcb_design_rules import get_effective_design_rules_from_file
+    except ImportError:
+        return {}
+    result = get_effective_design_rules_from_file(pcb_path)
+    if not result.get("success"):
+        return {}
+    return dict(result.get("design_rules") or {})
 
 
 def _check_position(
     index: int,
     via: ProposedVia,
     world: WorldModel,
-    edge_clear: float,
+    board: dict[str, float],
+    batch: list[ProposedVia],
 ) -> list[Violation]:
     out: list[Violation] = []
 
-    # Board edge: via center must be inside [minx+ec, maxx-ec] x [miny+ec, maxy-ec].
+    # ------------------------------------------------------------------
+    # 1. Board DRC size minimums (lower bounds; fail if requested value
+    #    is below the project's design rule).
+    # ------------------------------------------------------------------
+    min_size = board.get("min_via_size")
+    if min_size is not None and via.diameter < float(min_size) - 1e-9:
+        out.append(
+            Violation(
+                index,
+                "drc",
+                f"via diameter {via.diameter} mm is below board min_via_size {min_size} mm",
+                {
+                    "diameter": via.diameter,
+                    "min_via_size": float(min_size),
+                },
+            )
+        )
+    min_drill = board.get("min_through_drill")
+    if min_drill is not None and via.drill < float(min_drill) - 1e-9:
+        out.append(
+            Violation(
+                index,
+                "drc",
+                f"via drill {via.drill} mm is below board min_through_drill {min_drill} mm",
+                {
+                    "drill": via.drill,
+                    "min_through_drill": float(min_drill),
+                },
+            )
+        )
+    min_ann = board.get("min_via_annular_width")
+    if min_ann is not None:
+        annular = (via.diameter - via.drill) / 2.0
+        if annular < float(min_ann) - 1e-9:
+            out.append(
+                Violation(
+                    index,
+                    "drc",
+                    f"via annular ring {annular} mm is below board "
+                    f"min_via_annular_width {min_ann} mm",
+                    {
+                        "annular_width": annular,
+                        "min_via_annular_width": float(min_ann),
+                    },
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # 2. Hole-to-hole minimum distance.  Checked against every existing
+    #    via (any layer) and the other vias in the same batch (each
+    #    reported once at the later index).
+    # ------------------------------------------------------------------
+    min_h2h = board.get("hole_to_hole_min")
+    if min_h2h is not None:
+        threshold = float(min_h2h)
+        # Existing vias in the board.
+        for obs in world.obstacles:
+            if obs.kind != "via":
+                continue
+            c = obs.shape.centroid
+            ox, oy = c.x, c.y
+            dx = via.x - ox
+            dy = via.y - oy
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < threshold - 1e-9:
+                out.append(
+                    Violation(
+                        index,
+                        "drc",
+                        f"via at ({via.x}, {via.y}) is {dist:.3f} mm from existing "
+                        f"via at ({ox}, {oy}); board min_hole_to_hole is "
+                        f"{threshold} mm",
+                        {
+                            "x": via.x,
+                            "y": via.y,
+                            "other_x": ox,
+                            "other_y": oy,
+                            "distance": dist,
+                            "min_hole_to_hole": threshold,
+                            "other": "existing",
+                        },
+                    )
+                )
+        # Other vias in this batch (later index only).
+        for j, other in enumerate(batch):
+            if j <= index:
+                continue
+            dx = via.x - other.x
+            dy = via.y - other.y
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist < threshold - 1e-9:
+                out.append(
+                    Violation(
+                        index,
+                        "drc",
+                        f"via at ({via.x}, {via.y}) is {dist:.3f} mm from batch "
+                        f"via #{j} at ({other.x}, {other.y}); board "
+                        f"min_hole_to_hole is {threshold} mm",
+                        {
+                            "x": via.x,
+                            "y": via.y,
+                            "other_x": other.x,
+                            "other_y": other.y,
+                            "distance": dist,
+                            "min_hole_to_hole": threshold,
+                            "other": "batch",
+                            "other_index": j,
+                        },
+                    )
+                )
+
+    # ------------------------------------------------------------------
+    # 3. Board edge: via center must stay inside the outline with the
+    #    required copper-edge clearance.
+    # ------------------------------------------------------------------
+    edge_clear = float(board.get("copper_edge_clearance") or 0.0)
     if world.board_bbox is not None:
         minx, miny, maxx, maxy = world.board_bbox
         if (
@@ -304,9 +446,15 @@ def _check_position(
                 )
             )
 
-    # Pad ring on each copper layer the via occupies.
+    # ------------------------------------------------------------------
+    # 4. Pad ring collision on each copper layer the via occupies.
+    #    The ring is buffered by ``min_clearance`` so we report the
+    #    violation only when the new copper would be *closer* to a
+    #    foreign obstacle than the project allows.
+    # ------------------------------------------------------------------
+    min_clear = float(board.get("min_clearance") or 0.0)
     radius = via.diameter / 2.0
-    ring = Point(via.x, via.y).buffer(radius)
+    ring = Point(via.x, via.y).buffer(radius + min_clear)
     layers = set(via.layers)
 
     for obs in world.obstacles:
@@ -321,7 +469,8 @@ def _check_position(
                 Violation(
                     index,
                     obs.kind,
-                    f"via at ({via.x}, {via.y}) overlaps {obs.kind} {desc}",
+                    f"via at ({via.x}, {via.y}) overlaps {obs.kind} {desc}"
+                    + (f" with required clearance {min_clear} mm" if min_clear > 0 else ""),
                     {
                         "x": via.x,
                         "y": via.y,
@@ -329,6 +478,7 @@ def _check_position(
                         "obstacle_net": obs.net,
                         "obstacle_ref": obs.ref,
                         "layers": sorted(layers & obs.layers),
+                        "min_clearance": min_clear,
                     },
                 )
             )

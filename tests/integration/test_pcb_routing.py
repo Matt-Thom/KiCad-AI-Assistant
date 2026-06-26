@@ -401,6 +401,111 @@ class TestRoutingTool:
         vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
         assert len(vias) == 0
 
+    def test_batch_via_tool_rejects_below_min_via_size(self, pcb_copy):
+        # Fixture .kicad_pro sets min_via_diameter: 0.6 → user key
+        # min_via_size = 0.6.  Asking for 0.4 mm must be rejected.
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[{"x": 30.0, "y": 35.0, "net": "VCC", "diameter": 0.4, "drill": 0.2}],
+            ctx=None,
+        )
+        assert "error" in result
+        assert "drc" in result["error"]
+        assert "min_via_size" in result["error"]
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 0
+
+    def test_batch_via_tool_rejects_below_min_drill(self, pcb_copy):
+        # Fixture .kicad_pro sets min_through_hole_diameter: 0.3.
+        # Asking for 0.2 mm drill must be rejected.
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[{"x": 30.0, "y": 35.0, "net": "VCC", "diameter": 0.6, "drill": 0.2}],
+            ctx=None,
+        )
+        assert "error" in result
+        assert "drc" in result["error"]
+        assert "min_through_drill" in result["error"]
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 0
+
+    def test_batch_via_tool_rejects_below_min_hole_to_hole(self, pcb_copy):
+        # Place one via inside the board, then try to place a second one
+        # 0.1 mm away — well under fixture min_hole_to_hole: 0.25.
+        # Use VCC with explicit Power-class dimensions (0.8/0.4) so we
+        # don't trip the netclass check first.
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[
+                {"x": 30.0, "y": 35.0, "net": "VCC", "diameter": 0.8, "drill": 0.4},
+                {"x": 30.1, "y": 35.0, "net": "VCC", "diameter": 0.8, "drill": 0.4},
+            ],
+            ctx=None,
+        )
+        assert "error" in result
+        assert "drc" in result["error"]
+        assert "min_hole_to_hole" in result["error"]
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 0
+
+    def test_batch_via_tool_rejects_below_min_clearance(self, pcb_copy):
+        # R1 has a pad on F.Cu near (30.5, 32.5).  A via at (31.0, 31.0)
+        # has a 0.6 mm pad ring; with min_clearance=0.2 the buffered ring
+        # has radius 0.5, which overlaps the pad's clearance margin.
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[{"x": 31.0, "y": 31.0, "net": "GND", "diameter": 0.6, "drill": 0.3}],
+            ctx=None,
+        )
+        assert "error" in result
+        # Should be a footprint/pad overlap with the clearance note.
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 0
+
+    def test_batch_via_tool_accepts_drc_compliant(self, pcb_copy):
+        # Far from any obstacle, large enough for min_via_size, with
+        # sufficient spacing from the second via for min_hole_to_hole.
+        # Use VCC with explicit Power-class dimensions to satisfy both
+        # netclass and board DRC.
+        mcp = self._make_mcp()
+        result = self._call_tool(
+            mcp,
+            "pcb_add_vias",
+            pcb_path=pcb_copy,
+            vias=[
+                {"x": 30.0, "y": 20.0, "net": "VCC", "diameter": 0.8, "drill": 0.4},
+                {
+                    "x": 32.0,
+                    "y": 20.0,
+                    "net": "VCC",  # 2 mm away
+                    "diameter": 0.8,
+                    "drill": 0.4,
+                },
+            ],
+            ctx=None,
+        )
+        assert "via_count" in result, result
+        assert result["via_count"] == 2
+        data = load_pcb(pcb_copy)
+        vias = [item for item in data if _is_list(item) and _sym(item[0]) == "via"]
+        assert len(vias) == 2
+
     def test_multi_layer_tool_writes_segments_and_via(self, pcb_copy):
         # R1.2 is on F.Cu; D1.1 is on In1.Cu (GND).  Calling the tool
         # with target_layer="In1.Cu" should produce at least one via.

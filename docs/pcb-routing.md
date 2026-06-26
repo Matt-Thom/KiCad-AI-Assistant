@@ -104,12 +104,22 @@ Before any write, every via is checked against:
 
 * the matching ``.kicad_pro`` — the via's ``net`` must resolve to a
   netclass (or fall back to ``Default``), and the requested
-  ``diameter`` / ``drill`` must match that class (within 1 micron).
-  Missing ``.kicad_pro`` is a hard error: there is no silent skip.
+  ``diameter`` / ``drill`` must not exceed that class.  Missing
+  ``.kicad_pro`` is a hard error: there is no silent skip.
+* the project-level DRC rules in ``board.design_settings.rules`` —
+  ``min_via_size`` and ``min_through_drill`` are lower bounds on the
+  via dimensions; ``min_via_annular_width`` is the lower bound on
+  ``(diameter - drill) / 2``; ``min_clearance`` is the minimum
+  copper-to-copper distance (the via pad ring is buffered by this
+  before the collision check); ``hole_to_hole_min`` is the minimum
+  centre-to-centre distance between this via's hole and every
+  existing via's hole (and every other via in the same batch);
+  ``copper_edge_clearance`` keeps the via's centre inside the board
+  outline.
 * the board geometry — the via's pad ring must not overlap any
   footprint courtyard, other-net track/via, or zone keepout, and
   must stay inside the board outline with the configured
-  ``min_copper_edge_clearance``.
+  ``copper_edge_clearance``.
 
 Any violation rejects the whole batch and leaves the file
 untouched.  The error response includes a `violations` array with
