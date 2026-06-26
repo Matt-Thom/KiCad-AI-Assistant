@@ -30,7 +30,7 @@ from shapely.geometry import Point, Polygon
 from kcaa.utils.pcb_board_utils import get_fp_courtyard_bbox
 from kcaa.utils.pcb_sexp_utils import load_pcb
 
-ObstacleKind = Literal["footprint", "pad", "track", "via", "keepout", "board_edge"]
+ObstacleKind = Literal["footprint", "pad", "track", "via", "keepout", "board_edge", "drill"]
 
 
 @dataclass(frozen=True)
@@ -73,6 +73,7 @@ def build_world_model(
     pcb_path: str,
     net_filter: str | None = None,
     exclude_refs: set[str] | None = None,
+    include_footprints: bool = True,
 ) -> WorldModel:
     """Build a world model from a .kicad_pcb file.
 
@@ -82,7 +83,13 @@ def build_world_model(
             treated as obstacles (they belong to the route we're building).
         exclude_refs: Footprint references to exclude entirely (e.g. the
             footprint containing the start/end pad — no point routing around
-            itself).
+            itself). Only consulted when ``include_footprints`` is True.
+        include_footprints: When True (default), each footprint's courtyard
+            AABB is added as a forbidden region.  When False, footprints are
+            not added to the world model at all — only existing copper
+            (tracks, vias, keepouts) blocks the route.  This matches the
+            way most hand-routed PCBs work: the track only needs to dodge
+            existing copper, not the DRC spacing around other parts.
 
     Returns:
         A populated :class:`WorldModel`.
@@ -97,9 +104,20 @@ def build_world_model(
             continue
         tag = _sym(item[0])
         if tag == "footprint":
-            obs = _footprint_obstacle(item, exclude_refs)
-            if obs is not None:
-                model.obstacles.append(obs)
+            # NPTH drill holes are real copper-free regions on every
+            # layer, so they block routing independently of whether the
+            # caller wants footprint courtyards as obstacles.
+            fp_x, fp_y, fp_rot = _node_at3(item)
+            for sub in item:
+                if not _is_list(sub) or str(sub[0]) != "pad":
+                    continue
+                obs = _npth_obstacle(sub, fp_x, fp_y, fp_rot)
+                if obs is not None:
+                    model.obstacles.append(obs)
+            if include_footprints:
+                obs = _footprint_obstacle(item, exclude_refs)
+                if obs is not None:
+                    model.obstacles.append(obs)
         elif tag == "segment":
             obs = _segment_obstacle(item, net_filter)
             if obs is not None:
@@ -266,6 +284,71 @@ def _via_obstacle(via_node: list[Any], net_filter: str | None) -> Obstacle | Non
         layers=frozenset({"F.Cu", "B.Cu"}),
         net=net,
         kind="via",
+    )
+
+
+def _rotate_cw_on_screen(x: float, y: float, deg: float) -> tuple[float, float]:
+    """Rotate (x, y) by ``deg`` (CW-positive on screen, KiCad PCB convention).
+
+    In KiCad's +Y-down world, a positive file rotation is clockwise on
+    screen, equivalent to a math counter-clockwise rotation of -deg::
+
+        x' =  x*cos(d) + y*sin(d)
+        y' = -x*sin(d) + y*cos(d)
+
+    Local mirror of :func:`kcaa.router.router._rotate` so this module
+    doesn't depend on the router internals.
+    """
+    rad = math.radians(deg)
+    c, s = math.cos(rad), math.sin(rad)
+    return c * x + s * y, -s * x + c * y
+
+
+def _npth_obstacle(
+    pad_node: list[Any],
+    fp_x: float,
+    fp_y: float,
+    fp_rot: float,
+) -> Obstacle | None:
+    """Build a non-plated through-hole (NPTH) drill obstacle.
+
+    An NPTH is a bare mechanical hole — there is no copper pad, just a
+    circular keepout on every layer where the board is drilled.  A track
+    must not cross one.  The drill diameter (not the ``size``) is the
+    effective keepout radius.
+
+    Unlike ``_via_obstacle``, NPTH pads do not have a net, so the
+    ``net_filter`` argument is not consulted — the hole blocks every net.
+    """
+    pad_type = str(pad_node[1]) if len(pad_node) > 1 else ""
+    if pad_type != "np_thru_hole":
+        return None
+    # Pad ``at`` is in footprint-local coords.
+    at = _get_sub(pad_node, "at")
+    if at is None or len(at) < 3:
+        return None
+    try:
+        lx, ly = float(at[1]), float(at[2])
+    except (TypeError, ValueError):
+        return None
+    drill_sub = _get_sub(pad_node, "drill")
+    if drill_sub is None or len(drill_sub) < 2:
+        return None
+    try:
+        drill = float(drill_sub[1])
+    except (TypeError, ValueError):
+        return None
+    # Transform local → world (CW-on-screen, KiCad PCB convention).
+    wx_off, wy_off = _rotate_cw_on_screen(lx, ly, fp_rot)
+    wx, wy = fp_x + wx_off, fp_y + wy_off
+    return Obstacle(
+        shape=Point(wx, wy).buffer(drill / 2.0),
+        # NPTH goes through the whole stack: blocks routing on every
+        # copper layer the router might use.
+        layers=frozenset({"F.Cu", "B.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu"}),
+        net=None,
+        kind="drill",
+        ref=None,
     )
 
 

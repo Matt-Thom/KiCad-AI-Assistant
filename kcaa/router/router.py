@@ -231,12 +231,16 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     if pad_b_xy is None:
         raise RouteFailure(f"Pad {req.ref_b}/{req.pad_b} not found")
 
-    # World model: start/end footprints are excluded (we route out of them,
-    # not around them).
+    # World model: only existing copper (tracks, vias, keepouts) blocks the
+    # route.  Footprint courtyards are NOT obstacles — they're a DRC spacing
+    # concept, not a hard copper boundary, and treating them as forbidden
+    # forces pointless detours around parts.  Start/end footprints would be
+    # excluded anyway, but we skip the whole footprint layer.
     model = build_world_model(
         req.pcb_path,
         net_filter=req.net,
-        exclude_refs={req.ref_a, req.ref_b},
+        exclude_refs=set(),
+        include_footprints=False,
     )
 
     # Shrink obstacles by half the trace width (so the track is centered on
@@ -940,7 +944,20 @@ def _node_at3(node: list) -> tuple[float, float, float]:
 
 
 def _rotate(x: float, y: float, deg: float) -> tuple[float, float]:
-    """Rotate (x, y) by ``deg`` (CW-positive, matching KiCad's PCB convention)."""
+    """Rotate (x, y) by ``deg`` (CW-positive on screen, matching KiCad's PCB convention).
+
+    In KiCad's +Y-down world, a positive file rotation is clockwise on
+    screen, which is equivalent to a math counter-clockwise rotation of
+    -deg.  Substituting -deg into the standard CCW formula
+    (cos(-d) = cos(d), sin(-d) = -sin(d)) gives the CW-on-screen form:
+
+        x' =  x*cos(d) + y*sin(d)
+        y' = -x*sin(d) + y*cos(d)
+
+    This matches the formula used by
+    :func:`kcaa.utils.pcb_board_utils.get_fp_courtyard_bbox` and other
+    PCB geometry helpers in the codebase.
+    """
     rad = math.radians(deg)
     c, s = math.cos(rad), math.sin(rad)
-    return c * x - s * y, s * x + c * y
+    return c * x + s * y, -s * x + c * y
